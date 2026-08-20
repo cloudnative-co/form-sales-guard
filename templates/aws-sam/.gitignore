@@ -2,3 +2,5 @@ node_modules/
 .aws-sam/
 # デプロイ設定はシークレット類を含みうるためコミットしない
 samconfig.toml
+# 検収用の実例メール（tools/eval.mjs 用）。個人情報を含むため絶対にコミットしない
+samples/

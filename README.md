@@ -40,6 +40,7 @@
 | [templates/cloudflare-worker/](templates/cloudflare-worker/) | 経路A: Cloudflare Worker 単体構成（初心者向けデフォルト） |
 | [templates/email-routing/](templates/email-routing/) | 経路B: メール転送方式 —— 既存フォームを一切変えずに導入（通知メールを転送するだけ） |
 | [templates/aws-sam/](templates/aws-sam/) | 経路C: AWS 参照実装 —— 当社が実運用している構成のサニタイズ版（エンジニア向け雛形） |
+| [tools/eval.mjs](tools/eval.mjs) | 事前検収スクリプト —— 生成した判定基準を、あなたの実際のメールで運用前にテスト |
 | [site/](site/) | 公開サイト（[form-sales-guard.cn-shinji.workers.dev](https://form-sales-guard.cn-shinji.workers.dev)）のソース |
 
 ## 大事な注意
