@@ -133,7 +133,7 @@ description: お問い合わせフォームに届く営業スパム（フォー�
 2. **営業らしいテスト送信**: Step 2 で貼られたものに似た営業文（あなたが架空に作成）で送信 → SPAM として通知されず、隔離ボックス（`/quarantine` の署名付きリンク）に入ること
 3. **修正フローの確認**: 通知内の修正リンクを開く → 確認画面の実行ボタンを押す → 記録が更新され、次回分類の few-shot に反映されること（リンクを開いただけでは修正されないのが正しい挙動。GET は副作用なし）
 4. **fail-open の確認**: 一時的に不正なモデル名に変えて送信 → REVIEW（⚠️付き）として通知されること。**確認後に必ず戻す**
-5. **取り残しが見えることの確認（経路A）**: 分類結果を書き込めなかった状態を手で再現し、隔離ボックスに「未分類」として現れることを確認する。**本文の `aiLabel` も null に戻す必要がある**（metadata だけ戻しても表示条件を満たさない）。手順1の記録を `wrangler kv key get` で取り出し、`aiLabel` / `aiConfidence` / `aiReasoning` を null にした JSON を `samples/_stranded.json` に書いてから:
+5. **取り残しが見えることの確認（経路A）**: 分類結果を書き込めなかった状態を手で再現し、隔離ボックスに「未分類」として現れることを確認する。**本文の `aiLabel` も null に戻す必要がある**（metadata だけ戻しても表示条件を満たさない）。また、手順3で修正リンクを実行した記録は `humanLabel` が入っていて対象外になるため、**修正していない記録を使う**こと。対象の記録を `wrangler kv key get` で取り出し、`aiLabel` / `aiConfidence` / `aiReasoning` / `humanLabel` を null にした JSON を `samples/_stranded.json` に書いてから:
    ```
    npx wrangler kv key put --binding RECORDS --remote "<キー>" --path samples/_stranded.json --metadata '{"label":null,"corrected":false}'
    ```
