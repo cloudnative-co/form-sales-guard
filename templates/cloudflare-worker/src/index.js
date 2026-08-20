@@ -20,15 +20,13 @@ import { COMPANY_NAME, COMPANY_BLOCK, LABEL_BLOCK } from './criteria.js';
 const DEFAULT_MODEL = 'claude-sonnet-5';
 const ANTHROPIC_VERSION = '2023-06-01';
 // Cloudflare は HTTP 応答後の waitUntil() を約30秒で打ち切る。処理全体が収まるよう
-// 各段に予算を割り当てる: few-shot(3s) + 分類(18s) + 書き込み間隔(≤1.1s) + KV 更新(3s)
-// + 通知(3s) ≒ 28秒 < 30秒。分類だけでなく KV 更新・通知にも個別の期限を置くのは、
+// 各段に予算を割り当てる: few-shot(3s) + 分類(18s) + 書き込み間隔(≤1.1s) + 通知(3s)
+// + KV 更新(3s) ≒ 28秒 < 30秒。分類だけでなく KV 更新・通知にも個別の期限を置くのは、
 // 期限の無い段が 1 つでもあると、そこが遅い故障（エラーではなくハング）をしたとき
 // waitUntil ごとキャンセルされ、fail-open（catch → REVIEW / ⚠️通知）にも検知にも
 // 乗らない不可視の消失になるため。
-// 例外: 通知に失敗したときだけ走る undelivered の再 put（+1.1s + 3s）はこの予算の外側。
-// 全段が上限に張り付くと waitUntil ごと打ち切られて印が付かないが、平常時は通らない
-// 縮退専用の経路で、失敗しても「通知も無く隔離ボックスにも出ない」という手当て前の
-// 状態に戻るだけなので best-effort とする（予算を削って分類を短くする方が害が大きい）。
+// 予算の外側で走る段は 1 つも無い（分類後の同一キー書き込みは 1 回だけ。理由は
+// processSubmission のコメント参照）。段を増やすときは、この積算が 30 秒を超えないこと。
 const CLASSIFY_TIMEOUT_MS = 18_000;
 const FEW_SHOT_TIMEOUT_MS = 3_000; // few-shot 取得で分類本体を止めない（PITFALLS A-7）
 const STORE_TIMEOUT_MS = 3_000; // KV 操作の期限（受付/分類結果の put・隔離ボックスの list/get。ハングを検知可能な失敗に変える）
@@ -167,7 +165,7 @@ async function handleSubmit(request, env, ctx) {
     // この put は応答より前にあるため、期限を置かないと KV の遅い故障（エラーではなく
     // ハング）で応答も分類も通知も全部止まる。一方 KV の put は中断できず（options に
     // AbortSignal は無い）、同一キーの競合は last-write-wins なので、期限超過後に遅れて
-    // 着地した put が分類後の再 put を label:null で巻き戻す可能性は残る。この取り残しは
+    // 着地した put が分類後の put を label:null で巻き戻す可能性は残る。この取り残しは
     // /quarantine が「未分類」として拾う（handleQuarantine の UNCLASSIFIED_GRACE_MS 参照）
     await withTimeout(
       env.RECORDS.put(recordKey, JSON.stringify(record), { metadata: { label: null, corrected: false } }),
@@ -175,8 +173,13 @@ async function handleSubmit(request, env, ctx) {
       'Record save timeout',
     );
   } catch (error) {
-    // 記録より受付を優先して継続（縮退）。ただし修正リンクは使えない旨をログに残す
+    // 記録より受付を優先して継続（縮退）。ただし storageFailed を立てて通知側に伝える:
+    // ここで書けていない記録は隔離ボックスに現れないため、SPAM 判定でも通知を抑止しては
+    // ならない（KV 全断のとき、SPAM に落ちた本物のリードが消える唯一の経路がこれ）。
+    // 分類後の put の成否ではなくこの受付時 put の成否を見るのは、分類後の put が
+    // 通知より後ろにあり、通知の時点では結果が分からないため（processSubmission 参照）
     console.error(`Record save failed: ${message(error)}`);
+    record.storageFailed = true;
   }
 
   // 即応答し、分類・通知は応答後に実行（安全不変条件 3 / PITFALLS B-1）
@@ -193,57 +196,51 @@ async function processSubmission(env, record, acceptedAt) {
   record.aiReasoning = result.reasoning;
   record.classificationFailed = result.failed === true;
 
-  // 同一キーの受付時 put から最小間隔を空ける（MIN_KEY_WRITE_INTERVAL_MS のコメント参照）
+  // 同一キーの受付時 put から最小間隔を空ける（MIN_KEY_WRITE_INTERVAL_MS のコメント参照）。
+  // 待つのは通知の「前」。通知の後ろに置くと、下の put が通知から離れるぶん、
+  // 人間が修正リンクを実行してから put が着地する（＝修正を巻き戻す）窓が広がる
   const sinceAccept = Date.now() - acceptedAt;
   if (sinceAccept < MIN_KEY_WRITE_INTERVAL_MS) {
     await sleep(MIN_KEY_WRITE_INTERVAL_MS - sinceAccept);
   }
 
-  const updatedAt = Date.now();
-  try {
-    // metadata の label/corrected は /quarantine の絞り込み索引（本文 get を減らす）。
-    // put のハングも失敗として扱う（期限後に put が遅れて成功する可能性はあるが、
-    // その場合も ⚠️ 通知が余分に付くだけで安全側に倒れる）
-    await withTimeout(
-      env.RECORDS.put(record.key, JSON.stringify(record), {
-        metadata: { label: record.aiLabel, corrected: false },
-      }),
-      STORE_TIMEOUT_MS,
-      'Record update timeout',
-    );
-  } catch (error) {
-    // 保存できていないレコードは隔離ボックスに現れない。SPAM 判定のまま通知も
-    // 抑止すると問い合わせが完全に不可視になるため、保存失敗時は SPAM 扱いを
-    // やめて ⚠️ 付きで通常通知する（fail-open: 失敗は常に「人間行き」に倒す）
-    console.error(`Record update failed: ${message(error)}`);
-    record.storageFailed = true;
-  }
-
+  // ⚠️ 通知を先に出し、その結果まで含めて分類後の書き込みを「1回」で確定させること。
+  // 分類後に同一キーへ2回書く実装（分類結果 → 通知 → undelivered 印）は、次の3つの
+  // 経路でどれも「印だけが落ちて記録が隔離ボックスに出ない」不可視レコードを作る:
+  //   (1) 順序逆転 — KV の put は中断できず、期限超過後も走り続ける。同一キーの競合は
+  //       last-write-wins で発行順の保証が無いため、先行 put が後から着地して印を消す
+  //   (2) レート制限 — KV は同一キーへの書き込みを 1回/秒に制限し、超過は 429 で失敗する。
+  //       先行 put の「着地」時刻は測れないので、間隔の保証は遅い KV の下では成立しない
+  //   (3) waitUntil の打ち切り — 2回目の put は処理の尾部にあり、全段が上限に張り付くと
+  //       30秒に届いて印だけが書かれない
+  // 書き込みが1回なら競合相手が存在しないので、3つとも構造的に起こらない
+  // （Cloudflare 公式も「1 invocation 内の同一キー書き込みは1回にまとめる」を推奨）。
   const notified = await notify(env, record); // 通知失敗もここで握る（never-reject）
 
   // 通知が届かなかった記録は、この経路では人間の目に触れる面が1つも無くなる
   // （隔離ボックスは SPAM 専用で、LEAD/REVIEW は Slack にしか出ない）。Webhook の失効・
   // チャンネル削除・Slack 障害でも起きるので、設定の有無を見る fail-fast では塞げない。
-  // metadata に undelivered の印を付けて隔離ボックスに出す。通知に成功した平常時は
-  // ここを通らないため、書き込み回数は増えない
-  if (!notified) {
-    // metadata の undelivered と本文の notifyFailed は必ず同時に書くこと。
-    // 隔離ボックスは metadata で絞り込み・本文で確定するため、片方だけだと
-    // 「get はされるのに行にならない」＝不可視のまま ops だけ食う記録になる
-    record.notifyFailed = true;
-    try {
-      const sinceUpdate = Date.now() - updatedAt;
-      if (sinceUpdate < MIN_KEY_WRITE_INTERVAL_MS) await sleep(MIN_KEY_WRITE_INTERVAL_MS - sinceUpdate);
-      await withTimeout(
-        env.RECORDS.put(record.key, JSON.stringify(record), {
-          metadata: { label: record.aiLabel, corrected: false, undelivered: true },
-        }),
-        STORE_TIMEOUT_MS,
-        'Record update (undelivered) timeout',
-      );
-    } catch (error) {
-      console.error(`Record update (undelivered) failed: ${message(error)}`);
-    }
+  // metadata の undelivered と本文の notifyFailed は必ず同時に書くこと。隔離ボックスは
+  // metadata で絞り込み・本文で確定するため、片方だけだと「get はされるのに行にならない」
+  // ＝不可視のまま ops だけ食う記録になる
+  record.notifyFailed = !notified;
+
+  try {
+    // metadata の label/corrected は /quarantine の絞り込み索引（本文 get を減らす）
+    await withTimeout(
+      env.RECORDS.put(record.key, JSON.stringify(record), {
+        metadata: notified
+          ? { label: record.aiLabel, corrected: false }
+          : { label: record.aiLabel, corrected: false, undelivered: true },
+      }),
+      STORE_TIMEOUT_MS,
+      'Record update timeout',
+    );
+  } catch (error) {
+    // ここが書けなかった記録は metadata が受付時の label:null のまま残るため、
+    // 隔離ボックスの「未分類」が回収する（UNCLASSIFIED_GRACE_MS 経過後）。
+    // 受付時 put も失敗していた場合は storageFailed 経由で通知に倒れている
+    console.error(`Record update failed: ${message(error)}`);
   }
 }
 
@@ -447,7 +444,9 @@ function missingNotifyConfig(env) {
 /** 通知を試み、人間に届いたと言えるなら true を返す（隔離ボックスへの露出判定に使う） */
 async function notify(env, record) {
   try {
-    // 記録の保存に失敗した SPAM は隔離ボックスに現れないため、SPAM 扱いせず通常通知に流す
+    // 受付時の記録保存に失敗した SPAM は隔離ボックスに現れないため、SPAM 扱いせず通常通知に流す
+    // （storageFailed は受付時 put の成否。この通知は分類後 put より前に出るので、
+    //   分類後 put の成否はここでは分からない ── handleSubmit / processSubmission 参照）
     const isSpam = record.aiLabel === 'SPAM' && !record.classificationFailed && !record.storageFailed;
     const webhook = isSpam ? env.SLACK_WEBHOOK_SPAM : env.SLACK_WEBHOOK_URL;
     if (!webhook) {
@@ -460,7 +459,7 @@ async function notify(env, record) {
     const emoji = { LEAD: ':tada:', REVIEW: ':thinking_face:', SPAM: ':wastebasket:' }[record.aiLabel] || ':question:';
     const warn = [
       record.classificationFailed ? '\n:warning: *AI分類が失敗したため人間による確認が必要です*' : '',
-      record.storageFailed ? '\n:warning: *分類結果の保存に失敗しました。隔離ボックスに反映されないため、この通知で内容を確認してください*' : '',
+      record.storageFailed ? '\n:warning: *受付時の記録保存に失敗しました。隔離ボックスに残らない可能性があるため、この通知で内容を確認してください*' : '',
     ].join('');
     const links = await correctionLinks(env, record);
 
@@ -653,14 +652,22 @@ async function handleQuarantine(url, env) {
   let failed = 0; // 本文 get に失敗したキー数（poison key・KV 不調の検知）
   let done = false; // 最後まで走査し終えた（moreLink 不要）
   let listFailed = false; // 一覧の走査自体に失敗した（部分表示であることを画面に出す）
-  // この閲覧で再開位置(after)を進めた回数。0 のまま deadline で打ち切ると再開リンクが
-  // 今の URL と同一になり、何度押しても前に進まないループになるため、前進を条件にする
+  // この閲覧で再開位置(after)を進めた回数。deadline で打ち切ったとき再開リンクが今の URL と
+  // 同一になると、何度押しても前に進まないループになるため、「進捗」を deadline の前提にする。
   let advanced = 0;
+  // 進捗はキー(after)だけでなく cursor でも起きる。KV は削除・期限切れキーの内部走査で
+  // 「keys が空配列なのに list_complete=false」のページを返しうる（公式仕様。だから
+  // 空配列で終端を判定してはいけない）。この形では after が一度も進まないため、キー進捗
+  // だけを条件にすると deadline が永久に無効化され、list を MAX_PAGES 回まで直列に
+  // 積み上げてしまう。cursor が入力値から変わったかを独立に評価すること
+  const initialCursor = url.searchParams.get('cursor') || '';
+  const cursorAdvanced = () => (pageCursor || '') !== initialCursor;
 
   // ページ内の全キーが metadata で除外されると下の break 判定に到達しないため、
   // while の継続条件でも実時間を見る（そうしないと list を最大 MAX_PAGES 回まで
   // 直列に積み上げてしまい、宣言している上限を大きく超える）
-  const pageDeadlineReached = () => advanced > 0 && Date.now() - startedAt > QUARANTINE_PAGE_DEADLINE_MS;
+  const pageDeadlineReached = () =>
+    (advanced > 0 || cursorAdvanced()) && Date.now() - startedAt > QUARANTINE_PAGE_DEADLINE_MS;
 
   try {
     outer: while (pages < MAX_PAGES && ops < OPS_BUDGET && !pageDeadlineReached()) {
@@ -752,6 +759,14 @@ async function handleQuarantine(url, env) {
         done = true;
         break;
       }
+      // cursor が前進しない応答では、deadline も再開リンクも効かない（次の閲覧が同じ
+      // ページから始まる）。MAX_PAGES 回空回りして「0件」を返すより、走査できなかった
+      // ことを画面に出して止める（原則5: 縮退には検知を対にする）
+      if (list.cursor === pageCursor) {
+        console.error('Quarantine listing stalled: cursor did not advance');
+        listFailed = true;
+        break outer;
+      }
       pageCursor = list.cursor;
       after = '';
     }
@@ -778,8 +793,13 @@ async function handleQuarantine(url, env) {
   const strandedNote = unclassifiedCount + undeliveredCount > 0
     ? '<p>⚠️ 「未分類」は AI の判定結果を記録できないまま取り残された問い合わせ、「未配信」は通知の送信に失敗した問い合わせです。どちらも通知が出ていない可能性があるため、内容を確認して片付けてください。</p>'
     : '';
+  // 途中で打ち切って0行になったビューは「本当に隔離ゼロ」と見分けが付かない。
+  // 続きリンクだけでは 0 件表示のほうが目に入るため、打ち切りを明示する（原則5）
+  const truncatedEmptyNote = !done && !listFailed && rows.length === 0
+    ? '<p>⚠️ 時間内に走査しきれなかったため、この画面は<b>途中まで</b>です（0 件でも「隔離なし」ではありません）。下の「さらに古い記録を見る」で続きを確認してください。</p>'
+    : '';
   return html(`<h1>隔離ボックス（営業と判定されたもの・届かなかったもの）</h1>
-<p>未対応の SPAM ${spamCount} 件、未分類 ${unclassifiedCount} 件、未配信 ${undeliveredCount} 件を表示。メッセージは削除されず、ここからいつでも救出できます。月1回の確認をおすすめします。</p>${strandedNote}${listFailedNote}${failedNote}
+<p>未対応の SPAM ${spamCount} 件、未分類 ${unclassifiedCount} 件、未配信 ${undeliveredCount} 件を表示。メッセージは削除されず、ここからいつでも救出できます。月1回の確認をおすすめします。</p>${strandedNote}${truncatedEmptyNote}${listFailedNote}${failedNote}
 <table border="1" cellpadding="6" style="border-collapse:collapse">
 <tr><th>日付</th><th>判定</th><th>会社名</th><th>名前</th><th>本文（先頭100字）</th><th>操作</th></tr>
 ${rows.join('\n')}

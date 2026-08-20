@@ -58,7 +58,12 @@ Slack 修正ボタン POST /slack/actions
    **`.gitignore` 済み**（機微な判定基準を tracked な `processor.ts` に書かせないための分離。
    `processor.ts` は `import { CRITERIA } from './criteria.ts'` で読む — 拡張子 `.ts` は
    検収用の一時 JS が残留してもバンドルに紛れ込まないための意図的な指定）。
-   生成した基準はあなたのものであり、このリポジトリに投稿しない
+   生成した基準はあなたのものであり、このリポジトリに投稿しない。
+   デプロイ前の検収（`node <このリポジトリ>/tools/eval.mjs <このプロジェクト>`）は、
+   **本番と同じ `src/criteria.ts` をそのまま読む**（Node が型注釈を剥がして直接 import するため
+   **Node.js 22.18 以上が必要**・推奨 24 LTS）。検収用に別ファイルへ値を写さないこと —
+   写しを直しても本番のバンドルには載らないため、「検収で直したのに古い基準がデプロイされる」
+   という乖離が起きる（旧手順で作った `src/criteria.mjs` が残っていると検収は停止する）
 2. **Secrets Manager にシークレットを作成**: JSON で `ANTHROPIC_API_KEY` / `SLACK_BOT_TOKEN` /
    `SLACK_SIGNING_SECRET` を格納し、ARN を `SecretsArn` パラメータに渡す
 3. **Slack App の作成**: Bot Token Scopes に `chat:write`。デプロイ後、Outputs の
@@ -74,12 +79,43 @@ Slack 修正ボタン POST /slack/actions
    lockfile と `UseNpmCi` が両方揃ったときだけで、片方だけだと `npm install` に戻って版が動く。
    なお `UseNpmCi` は SAM のビルドイメージによっては `Invalid build flag` になることがある。
    その場合は lockfile のコミットだけでも実務上はほぼ固定される
-5. **既に運用中のスタックを更新する場合の注意**: 今回追加した `ClassifierLogGroup`
+5. **既に運用中のスタックを更新する場合の注意**: 追加された `ClassifierLogGroup`
    （`/aws/lambda/form-guard-classifier`）は、既存スタックでは Lambda が自動作成した
    同名のロググループが CloudFormation の管理外に存在するため、`already exists` で
-   スタック更新が失敗する。更新前にログを退避したうえで
-   `aws logs delete-log-group --log-group-name /aws/lambda/form-guard-classifier` するか、
-   CloudFormation のリソースインポートで取り込むこと（新規デプロイでは何も要らない）
+   スタック更新が失敗する（新規デプロイでは何も要らない）。対処は2択:
+
+   **(A) 既存のログを残したまま取り込む（推奨）** — CloudFormation の auto-import を使う。
+   このテンプレートのロググループは `DeletionPolicy: Retain` + 静的な `LogGroupName` を
+   持たせてあるので、auto-import の要件を満たしている。`sam deploy` には import 機能が無いため、
+   `sam build` の出力を使って CLI でチェンジセットを組む（通常の UPDATE なので、同じ更新で
+   メトリクスフィルタ・アラームも一緒に作れる）:
+
+   ```bash
+   sam build
+   aws cloudformation create-change-set \
+     --stack-name <スタック名> --change-set-name import-loggroups \
+     --change-set-type UPDATE --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+     --template-body file://.aws-sam/build/template.yaml \
+     --import-existing-resources
+   aws cloudformation describe-change-set --stack-name <スタック名> --change-set-name import-loggroups
+   aws cloudformation execute-change-set --stack-name <スタック名> --change-set-name import-loggroups
+   ```
+
+   実行後は `aws cloudformation detect-stack-drift` でドリフト検出をかけることが推奨されている。
+
+   **(B) ログが要らないなら、退避して消してから `sam deploy`**:
+
+   ```bash
+   # Lambda が自動作成したロググループは既定で「失効しない」ので、--since は運用開始日を含む長さにする
+   aws logs tail /aws/lambda/form-guard-classifier --since 3650d > classifier-logs.txt
+   aws logs delete-log-group --log-group-name /aws/lambda/form-guard-classifier
+   sam build && sam deploy
+   ```
+
+   `aws logs tail` の出力は時刻・ストリーム名・本文に整形されたテキストで、忠実なエクスポートでは
+   ない（原本が要るなら `aws logs create-export-task` で S3 に出す）。また削除から `sam deploy`
+   完了までの間にフォーム送信が入ると Lambda がロググループを作り直し、再び `already exists` で
+   落ちる。その場合は削除からやり直す（送信の少ない時間帯が確実）
 6. **費用上限の設定**（安全不変条件 7・スキップ不可）: Anthropic Console の Usage limits と
    AWS Budgets を必ず設定する
 7. **テスト送信**: 正常系（LEAD 相当）→ Slack 通知確認 → 修正ボタン → DynamoDB の
@@ -97,6 +133,9 @@ SPAM も削除されず (1) DynamoDB の全レコード、(2) SPAM 専用 Slack 
 |---|---|
 | A-1 モデル引退のサイレント劣化 | `claude.ts` の `MODEL_ID` 1箇所集約 + `template.yaml` の分類失敗アラーム |
 | 安全不変条件5 受付の hard fail が無検知 | `template.yaml` の `ClassifierErrorAlarm`（`"Handler error"` のメトリクスフィルタ）。catch 済みの失敗は Lambda の Errors には乗らない |
+| 安全不変条件5 poison pill が滞留アラームから消える | `template.yaml` の `ProcessorErrorAlarm`（`AWS/Lambda` の `Errors`）。標準キューは3回以上受信されたメッセージを `ApproximateAgeOfOldestMessage` の対象から外すため、失敗し続けるメッセージは `QueueAgeAlarm` では検知できない。2本は役割が違う（詳細は template.yaml のコメント） |
+| 安全不変条件5 受付が catch 外で落ちると無検知 | `template.yaml` の `ClassifierLambdaErrorAlarm`（`AWS/Lambda` の `Errors`）。`getConfig()` は try の外・タイムアウト/OOM/初期化エラーも同様で、`"Handler error"` のフィルタでは拾えない |
+| 安全不変条件2/5 壊れた SQS メッセージが無音で捨てられる | `template.yaml` の `MalformedMessageAlarm`。skip（`continue`）は正常終了なので DLQ にも `Errors` にも乗らず、レコードが `received` のまま取り残される |
 | A-2/A-3 thinking ブロックと max_tokens | `claude.ts` の text ブロック探索・`max_tokens: 4096` |
 | A-4 LLM 出力の防御的パース | `claude.ts` の型ガード（label enum / confidence 丸め / reasoning フォールバック+500字） |
 | A-5 SDK タイムアウトの階層 | `claude.ts` の `timeout: 60_000, maxRetries: 0`（再試行を断ち単一 60s < Lambda 120s）+ `classifier/processor/feedback.ts` の AWS SDK 各 client に requestTimeout / `throwOnRequestTimeout: true`（無いと超過は警告のみ）/ `socketTimeout`（body 局面の無通信検知）。SDK は `template.yaml` でバンドルし、版が変動する同梱 SDK ではなく `^3.910.0` 以上を使わせる（厳密な版固定は lockfile 側の責務 — 手順4） |
@@ -131,7 +170,9 @@ DynamoDB に単純化しているが、以下のインターフェースで差�
 
 - **SQS の重複配送に対する冪等性がない**: SQS 標準キューは at-least-once 配送であり、稀な重複配送時は Slack 通知が二重に投稿され、後着の `slackMessageTs` が先着を上書きする（問い合わせデータ自体は壊れない）。厳密にするなら recordId ベースの条件付き状態遷移（`received`→`processing` の conditional update）を入れる
 - **修正ボタンの処理が同期的**: Slack の 3 秒 ack 要件に対し、Secrets 取得〜GSI Query〜UpdateItem〜chat.update を完了してから 200 を返すため、遅延時は Slack 側にエラー表示が出ることがある（**DB への記録は成功していることがある**。メッセージのボタンが残っていれば再度押してよい — 記録済みなら no-op になる）。また GSI は結果整合のため、通知の投稿直後にボタンを押すと逆引きに失敗して無視されることがある（数秒待って押し直せばよい）。厳密にするなら署名検証後に即 ack して処理を非同期化する
-- **DynamoDB 保存と SQS 送信が非トランザクション**: PutItem 成功後に SendMessage が失敗すると `received` のまま処理されないレコードが残る（クライアントには 500 が返るため利用者は再送でき、運用者には `form-guard-classifier-errors` アラームが飛ぶ）。PutItem 自体が失敗した場合も同様に 500 + 同アラームで、受付は成立しない＝台帳にも Slack にも出ない。**この経路の「届く」は「運用者に通知が届く」ではなく「送信者にエラーが返り、運用者にはアラームが飛ぶ」であることに注意**（経路A/B は保存に失敗しても通知・転送に倒れるので形が違う）。厳密にするなら outbox パターンか未投入レコードの定期照合を入れる
+- **DynamoDB 保存と SQS 送信が非トランザクション**: PutItem 成功後に SendMessage が失敗すると `received` のまま処理されないレコードが残る（クライアントには 500 が返るため利用者は再送でき、運用者には `form-guard-classifier-errors` アラームが飛ぶ）。PutItem 自体が失敗した場合も同様に 500 + 同アラームで、受付は成立しない＝台帳にも Slack にも出ない（なお `Handler error` を出さずに落ちる失敗＝設定欠落・初期化エラー・タイムアウト・OOM は `ClassifierLambdaErrorAlarm` が拾う）。**この経路の「届く」は「運用者に通知が届く」ではなく「送信者にエラーが返り、運用者にはアラームが飛ぶ」であることに注意**（経路A/B は保存に失敗しても通知・転送に倒れるので形が違う）。厳密にするなら outbox パターンか未投入レコードの定期照合を入れる
+- **Lambda のスロットリングによる停滞はどちらのアラームでも見えない**: 同時実行数の上限に当たって invoke が絞られると、`Throttles` は増えるが `Errors` は増えず（`ProcessorErrorAlarm` は鳴らない）、SQS 側では受信カウントが加算されるためメッセージが3回受信を超えて `ApproximateAgeOfOldestMessage` から外れる（`QueueAgeAlarm` も鳴らない）。低流量前提では起きないため雛形には入れていないが、流量が増えたら `AWS/Lambda` の `Throttles` にもアラームを足すこと
+- **ロググループはスタック削除後も残る**: 既存スタックへの auto-import（手順5）を成立させるため `DeletionPolicy: Retain` を付けている。`sam delete` で片付けきりたい場合は `aws logs delete-log-group` を手で実行する（`RetentionInDays: 90` は残るので放置してもログ自体は消える）
 - **Processor の SQS 実行ロールは全キュー対象**: DynamoDB/Secrets の IAM は最小化したが、SAM が SQS イベントソース用に付与する実行ロール（`AWSLambdaSQSQueueExecutionRole`）は `ReceiveMessage`/`DeleteMessage` の Resource が `*`（全キュー）になる。厳密には Processor に custom role を指定し、対象 `ProcessingQueue` の ARN だけに限定する
 - **タイムアウトは各 SDK 呼び出し単位で、end-to-end のハード上限ではない**: Anthropic は `maxRetries:0`（60s 単発）、AWS SDK 各 client は明示 requestTimeout + `throwOnRequestTimeout: true` + `socketTimeout`（requestTimeout は headers 到達で解除されるため、body が止まる故障は socketTimeout の無通信検知が受け持つ。SDK はバンドルして `^3.910.0` 以上を保証 — ランタイム同梱 SDK は版が変動し timeout の意味論ごと変わる。ただし caret は下限の保証であって版の固定ではないので、再現可能なビルドが要るなら lockfile をコミットすること）。各呼び出しの実効上限は「maxAttempts × timeout + バックオフ」。残る穴は2つ: (1) データが細く流れ続ける trickle 応答は socketTimeout をすり抜ける — `processor` は Lambda 120s → SQS 再配信 → DLQ アラームで検知され、`classifier` は 25s で死に送信者にエラーが見える（無音の消失にはならない） (2) 複数 await の積み上げが理論上 Lambda 上限を超えうる — 厳密にするなら各 await を Lambda 残時間（`context.getRemainingTimeInMillis()`）ベースの deadline で締める
 

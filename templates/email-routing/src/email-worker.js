@@ -37,8 +37,11 @@ const FEW_SHOT_TIMEOUT_MS = 3_000;
 // Slack Webhook の期限。notify の戻り値は最後の砦（全滅時 throw）の判定に使われるため、
 // ここがハング（エラーではなく無応答）するとハンドラごと止まり throw に到達しない
 const NOTIFY_TIMEOUT_MS = 10_000;
-// KV は同一キーへの書き込みを約1回/秒に制限する。保存直後の forwardFailed 再 put が
-// レート制限で落ちないよう、再 put は最小間隔を空ける
+// KV は同一キーへの書き込みを約1回/秒に制限し、超過は 429 を throw する。保存直後の
+// 再 put がレート制限で落ちないよう最小間隔を空ける。
+// ⚠️ この保証が成り立つのは「同一キーへの再 put が1回だけ」かつ「起点が直前の put の
+// 完了時刻」のときに限る。間に別の put を挟むと2回目と3回目が密着し、429 で落ちるのが
+// 唯一の可視化マーカーを運ぶ最後の put になる（実際にそうなっていた）
 const MIN_KEY_WRITE_INTERVAL_MS = 1_100;
 // 隔離ボックスの list/get の期限（ハングを検知可能な失敗に変える）
 const STORE_TIMEOUT_MS = 3_000;
@@ -166,7 +169,10 @@ export default {
       correctedAt: null,
     };
     let stored = true;
-    const storedAt = Date.now();
+    // ⚠️ 書き込み間隔の起点は put の「発行前」ではなく「完了後」に取ること。KV の 1回/秒 制限は
+    // 着地を基準にするので、発行前を起点にすると put が 800ms かかった場合に次の書き込みが
+    // 300ms 後になり 429 で落ちる（経路A も acceptedAt を await 完了後に取っている）
+    let storedAt = Date.now();
     try {
       // metadata は /quarantine が本文を get せず SPAM を絞り込むための索引
       await env.RECORDS.put(recordKey, JSON.stringify(record), {
@@ -177,6 +183,7 @@ export default {
       stored = false;
       record.storageFailed = true;
     }
+    storedAt = Date.now();
 
     // SPAM の転送抑止は「隔離ボックスに保存できた」ことが前提。保存に失敗した
     // メールまで抑止すると、転送も隔離もされず完全に消失する（KV 障害・書き込み
@@ -195,21 +202,14 @@ export default {
       } catch (error) {
         // 転送失敗を throw すると下の notify に到達せず、非SPAMは隔離ボックスにも
         // 出ないため完全に不可視になる。捕捉して Slack 通知に倒す（fail-open）。
-        // 保存できている場合は forwardFailed を永続化し、後から気づけるようにする
+        // ⚠️ ここで put しないこと。KV は同一キーへの書き込みを 1回/秒に制限しており、
+        // ここで1回使うと、直後の「唯一の可視化マーカー（undelivered）を運ぶ put」が
+        // 429 で落ちる。しかもこの中間 put が永続化する forwardFailed を読むコードは
+        // 製品内に無く metadata も変えないため、実効果は「印を書く直前に書き込み予算を
+        // 食い潰す」ことだけだった。ここではフラグを立てるだけにして、通知の結果を見て
+        // から必要なときだけ1回書く（Cloudflare 公式も書き込みの集約を推奨）
         console.error(`Forward failed: ${message2(error)}`);
         record.forwardFailed = true;
-        if (stored) {
-          try {
-            // 同一キーの保存直後なので、KV の書き込みレート制限（約1回/秒/キー）まで待つ
-            const sinceStore = Date.now() - storedAt;
-            if (sinceStore < MIN_KEY_WRITE_INTERVAL_MS) await sleep(MIN_KEY_WRITE_INTERVAL_MS - sinceStore);
-            await env.RECORDS.put(recordKey, JSON.stringify(record), {
-              metadata: { label: result.label, corrected: false },
-            });
-          } catch (e) {
-            console.error(`Record update (forwardFailed) failed: ${message2(e)}`);
-          }
-        }
       }
     }
 
@@ -218,7 +218,16 @@ export default {
     const notified = await notify(env, record);
 
     // 転送にも通知にも失敗した非SPAM は、KV には残るのに人間の目に触れる面が無くなる
-    // （隔離ボックスは SPAM 専用）。metadata に undelivered の印を付けて隔離ボックスに出す
+    // （隔離ボックスは SPAM 専用）。metadata の undelivered で隔離ボックスに出す。
+    // 同一キーへの2回目の書き込みはここだけ（転送失敗を put で永続化する中間段は廃止した）。
+    // 転送に失敗しても通知が届いていれば書かない: その記録は Slack で人間に届いており
+    // （通知文にも「この通知が唯一の記録です」と出る）、隔離ボックスの絞り込み条件も
+    // 変わらないので、書いても読み手がいないまま「通知後の put が人間の修正を
+    // 上書きする窓」を平常系に広げるだけになる。
+    // この put が成功して初めて「隔離ボックスで見える」と言える。失敗したままだと
+    // metadata が put#1 の {label} のままで SPAM 以外は絞り込みから外れる＝不可視になるため、
+    // 成否を下の全滅判定に渡す（印を書けなかったことを「書けた」と扱わない）
+    let deliveryStateSaved = false;
     if (stored && !isSpam && record.forwardFailed && !notified) {
       // metadata の undelivered と本文の notifyFailed は必ず同時に書くこと。
       // 隔離ボックスは metadata で絞り込み・本文で確定するため、片方だけだと
@@ -230,14 +239,18 @@ export default {
         await env.RECORDS.put(recordKey, JSON.stringify(record), {
           metadata: { label: result.label, corrected: false, undelivered: true },
         });
+        deliveryStateSaved = true;
       } catch (e) {
         console.error(`Record update (undelivered) failed: ${message2(e)}`);
       }
     }
 
-    // 非SPAM で「転送も保存も通知も」全て失敗した最悪ケースだけは、正常終了せず throw して
-    // Cloudflare にメールを委ねる（一時エラー・再送に倒れれば配送機会が残る）。
-    // ここで setReject を使わないのは意図的: この分岐が発火するのは3経路が同時に落ちる
+    // 非SPAM で「転送も通知も失敗し、隔離ボックスにも出せなかった」最悪ケースだけは、
+    // 正常終了せず throw して Cloudflare にメールを委ねる（再送に倒れれば配送機会が残る）。
+    // 判定は「保存できたか（stored）」ではなく「隔離ボックスで見えるか」で行うこと:
+    // put#1 に成功していても、上の delivery state の put が落ちていれば metadata は
+    // {label} のままで、SPAM 以外は隔離ボックスの絞り込みから外れる＝人間には見えない。
+    // ここで setReject を使わないのは意図的: この分岐が発火するのは複数経路が同時に落ちる
     // 相関した「一過性」障害のときで、恒久 SMTP エラー（hard bounce）を返すと
     // フォームサービス（SendGrid 等）が受信アドレスを suppression list に載せ、
     // 以後の通知メールがサービス側で送られなくなる＝1通の損失が恒久的な全損に化ける。
@@ -245,8 +258,9 @@ export default {
     // 注: ハンドラ失敗時に Email Routing が送信側 MTA に一時エラーを返す挙動は公式
     // ドキュメントに明文が無い（実観測ベース）。それでも「正常終了で握りつぶす」より
     // throw の方が安全側 — 最低でも黙って消えることはない
-    if (!isSpam && record.forwardFailed && !stored && !notified) {
-      throw new Error('All delivery paths failed (no forward, no storage, no notification)');
+    const visibleInQuarantine = stored && deliveryStateSaved;
+    if (!isSpam && record.forwardFailed && !notified && !visibleInQuarantine) {
+      throw new Error('All delivery paths failed (no forward, no notification, not visible in quarantine)');
     }
   },
 
@@ -432,12 +446,16 @@ async function alertOperator(env, title, detail, from) {
     const text = `:rotating_light: *[${escapeSlackText(title)}]* form-guard
 ${escapeSlackText(detail)}
 差出人: ${escapeSlackText(from || '(不明)')}`;
-    await fetch(webhook, {
+    const res = await fetch(webhook, {
       method: 'POST',
       signal: controller.signal,
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ text, unfurl_links: false, unfurl_media: false }),
     });
+    // 応答コードを見ないと、Webhook 失効(404)・アプリ削除(410)・レート制限(429)・
+    // 不正ペイロード(400) がすべて「送れた」ことになり、事故の件数より警告が少ない
+    // ことに運用者が気づけない。notify() と同じく非2xx は失敗として記録する（原則5）
+    if (!res.ok) throw new Error(`Webhook HTTP ${res.status}`);
   } catch (error) {
     console.error(`Notification failed: ${message2(error)}`);
   } finally {
@@ -631,14 +649,22 @@ async function handleQuarantine(url, env) {
   let failed = 0; // 本文 get に失敗したキー数（poison key・KV 不調の検知）
   let done = false; // 最後まで走査し終えた（moreLink 不要）
   let listFailed = false; // 一覧の走査自体に失敗した（部分表示であることを画面に出す）
-  // この閲覧で再開位置(after)を進めた回数。0 のまま deadline で打ち切ると再開リンクが
-  // 今の URL と同一になり、何度押しても前に進まないループになるため、前進を条件にする
+  // この閲覧で再開位置(after)を進めた回数。deadline で打ち切ったとき再開リンクが今の URL と
+  // 同一になると、何度押しても前に進まないループになるため、「進捗」を deadline の前提にする。
   let advanced = 0;
+  // 進捗はキー(after)だけでなく cursor でも起きる。KV は削除・期限切れキーの内部走査で
+  // 「keys が空配列なのに list_complete=false」のページを返しうる（公式仕様。だから
+  // 空配列で終端を判定してはいけない）。この形では after が一度も進まないため、キー進捗
+  // だけを条件にすると deadline が永久に無効化され、list を MAX_PAGES 回まで直列に
+  // 積み上げてしまう。cursor が入力値から変わったかを独立に評価すること
+  const initialCursor = url.searchParams.get('cursor') || '';
+  const cursorAdvanced = () => (pageCursor || '') !== initialCursor;
 
   // ページ内の全キーが metadata で除外されると下の break 判定に到達しないため、
   // while の継続条件でも実時間を見る（そうしないと list を最大 MAX_PAGES 回まで
   // 直列に積み上げてしまい、宣言している上限を大きく超える）
-  const pageDeadlineReached = () => advanced > 0 && Date.now() - startedAt > QUARANTINE_PAGE_DEADLINE_MS;
+  const pageDeadlineReached = () =>
+    (advanced > 0 || cursorAdvanced()) && Date.now() - startedAt > QUARANTINE_PAGE_DEADLINE_MS;
 
   try {
     outer: while (pages < MAX_PAGES && ops < OPS_BUDGET && !pageDeadlineReached()) {
@@ -728,6 +754,14 @@ async function handleQuarantine(url, env) {
         done = true;
         break;
       }
+      // cursor が前進しない応答では、deadline も再開リンクも効かない（次の閲覧が同じ
+      // ページから始まる）。MAX_PAGES 回空回りして「0件」を返すより、走査できなかった
+      // ことを画面に出して止める（原則5: 縮退には検知を対にする）
+      if (list.cursor === pageCursor) {
+        console.error('Quarantine listing stalled: cursor did not advance');
+        listFailed = true;
+        break outer;
+      }
       pageCursor = list.cursor;
       after = '';
     }
@@ -754,8 +788,13 @@ async function handleQuarantine(url, env) {
   const strandedNote = unclassifiedCount + undeliveredCount > 0
     ? '<p>⚠️ 「未分類」は AI の判定結果を記録できないまま取り残されたメール、「未配信」は転送にも Slack 通知にも失敗したメールです。どちらも人間に届いていない可能性があるため、内容を確認して片付けてください。</p>'
     : '';
+  // 途中で打ち切って0行になったビューは「本当に隔離ゼロ」と見分けが付かない。
+  // 続きリンクだけでは 0 件表示のほうが目に入るため、打ち切りを明示する（原則5）
+  const truncatedEmptyNote = !done && !listFailed && rows.length === 0
+    ? '<p>⚠️ 時間内に走査しきれなかったため、この画面は<b>途中まで</b>です（0 件でも「隔離なし」ではありません）。下の「さらに古い記録を見る」で続きを確認してください。</p>'
+    : '';
   return html(`<h1>隔離ボックス（営業と判定されたメール・届かなかったもの）</h1>
-<p>未対応の SPAM ${spamCount} 件、未分類 ${unclassifiedCount} 件、未配信 ${undeliveredCount} 件を表示。メールは削除されず、ここからいつでも本文（先頭1万字・添付は保存されません）の確認と救出ができます。月1回の確認をおすすめします。</p>${strandedNote}${listFailedNote}${failedNote}
+<p>未対応の SPAM ${spamCount} 件、未分類 ${unclassifiedCount} 件、未配信 ${undeliveredCount} 件を表示。メールは削除されず、ここからいつでも本文（先頭1万字・添付は保存されません）の確認と救出ができます。月1回の確認をおすすめします。</p>${strandedNote}${truncatedEmptyNote}${listFailedNote}${failedNote}
 <table border="1" cellpadding="6" style="border-collapse:collapse">
 <tr><th>日付</th><th>判定</th><th>差出人</th><th>件名</th><th>本文（先頭100字）</th><th>操作</th></tr>
 ${rows.join('\n')}

@@ -18,17 +18,34 @@
  *
  * データの行き先は Anthropic API のみ（本番の分類と同一）。他への送信・保存は一切しない。
  * 注意: 基準生成に使った例をここに入れると精度が盛れる。検収用は必ず未使用の例にすること。
- * 注意: この検収は判定基準（経路A/B は criteria.js、経路C は criteria.mjs）の品質を測る
- *       簡易評価であり、本番の分類には few-shot 例・会社名等の文脈が加わるため、
- *       結果は本番と完全一致はしない。
+ * 注意: この検収は判定基準（経路A/B は src/criteria.js、経路C は src/criteria.ts —— どちらも
+ *       本番が読むファイルそのもの）の品質を測る簡易評価であり、本番の分類には few-shot 例・
+ *       会社名等の文脈が加わるため、結果は本番と完全一致はしない。
+ * 注意: 経路C（TypeScript）の検収には Node.js 22.18 以上が必要（推奨 24 LTS）。
  * 費用の目安: 1件あたり claude-sonnet-5 で約$0.02、claude-haiku-4-5 で約$0.01。
  *
- * 終了コード: 0 = 全件正解 / 1 = 誤分類あり or サンプル不足 / 2 = 分類エラーあり
+ * 終了コード: 0 = 全件正解 / 1 = 誤分類あり、または判定基準・サンプルの不備
+ *            / 2 = 分類エラーあり、または実行環境の不備（API キー欠落・Node が古い）
  */
 
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { createHash } from 'node:crypto';
+
+// Node は package.json に "type" の無いディレクトリの ESM を読むと
+// MODULE_TYPELESS_PACKAGE_JSON 警告を出す。経路C の判定基準（src/criteria.ts）の
+// 読み込みで毎回これが出ると、利用者には「何か壊れた」ようにしか見えない。
+// templates/aws-sam/package.json に "type":"module" を足すと SAM の esbuild バンドルの
+// 出力形式が変わって壊れるため、こちら側でこの1種類だけを黙らせる
+const emitWarning = process.emitWarning.bind(process);
+process.emitWarning = (warning, ...rest) => {
+  const code = rest.find((a) => typeof a === 'string' && a.startsWith('MODULE_')) ||
+    rest.find((a) => a && typeof a === 'object' && a.code)?.code ||
+    (warning && warning.code);
+  if (code === 'MODULE_TYPELESS_PACKAGE_JSON') return;
+  return emitWarning(warning, ...rest);
+};
 
 const MODEL = process.env.MODEL || 'claude-sonnet-5';
 const LABELS = ['LEAD', 'REVIEW', 'SPAM'];
@@ -70,15 +87,29 @@ if (!API_KEY) {
   2. 実行前に環境変数として export しておく`);
   process.exit(2);
 }
-// 経路A/B は src/criteria.js、経路C は検収用アダプタ src/criteria.mjs を読む
-// （.mjs は package.json の type や Node の版に関係なく常に ESM として読まれるため、
-// "type":"module" を持たない経路C プロジェクトでも確実に import できる）
-const criteriaCandidates = ['criteria.js', 'criteria.mjs']
+// 検収は「本番が読むファイルそのもの」を読む。経路A/B は src/criteria.js、
+// 経路C は src/criteria.ts（Node 22.18+ が型注釈を剥がして直接 import できる）。
+// ⚠️ 検収用に別ファイル（写し・アダプタ）を読ませてはいけない。誤分類が出たとき、
+// この検収は「基準に類型を追記して再実行」を案内するが、その追記先が本番の読まない
+// ファイルだと、直した本人にも分からないまま古い基準がデプロイされる
+const criteriaCandidates = ['criteria.js', 'criteria.ts']
   .map((f) => join(projectDir, 'src', f))
   .filter((p) => existsSync(p));
 const samplesDir = join(projectDir, 'samples');
+
+// 旧手順（criteria.ts から値を手で写した検収用アダプタ）の残骸。本番と二重管理になり、
+// 上の乖離をそのまま作るため、残っていたら消させる
+const obsoleteAdapter = join(projectDir, 'src', 'criteria.mjs');
+if (existsSync(obsoleteAdapter)) {
+  console.error(`旧手順の検収用アダプタが残っています: ${obsoleteAdapter}
+このファイルを削除してから再実行してください。現在の検収は本番が読むファイルそのもの
+（経路A/B は src/criteria.js、経路C は src/criteria.ts）を直接読みます。
+写しを検収すると、検収で直した基準が本番に載らないまま「合格」が出ます。`);
+  process.exit(1);
+}
+
 if (criteriaCandidates.length === 0) {
-  console.error(`判定基準が見つかりません: ${join(projectDir, 'src')}/criteria.js（経路A/B）または criteria.mjs（経路C）\n先に SKILL.md Step 2 で判定基準を生成してください。`);
+  console.error(`判定基準が見つかりません: ${join(projectDir, 'src')}/criteria.js（経路A/B）または criteria.ts（経路C）\n先に SKILL.md Step 2 で判定基準を生成してください。`);
   process.exit(1);
 }
 // 両方あると「どちらを測ったのか」が結果から判別できない。旧手順で作った criteria.js が
@@ -87,7 +118,7 @@ if (criteriaCandidates.length === 0) {
 if (criteriaCandidates.length > 1) {
   console.error(`判定基準のファイルが2つあります。どちらを測ったのか判別できないため中止します:
 ${criteriaCandidates.map((p) => `  - ${p}`).join('\n')}
-経路A/B は src/criteria.js だけ、経路C は src/criteria.mjs だけを置いてください
+経路A/B は src/criteria.js だけ、経路C は src/criteria.ts だけを置いてください
 （経路C の本番コードが読むのは src/criteria.ts です。旧手順で作った criteria.js が
 残っている場合は削除してから再実行してください）。`);
   process.exit(1);
@@ -103,7 +134,43 @@ if (!existsSync(samplesDir)) {
 // 両方を受け入れる。ESM の動的 import は存在しない export を例外にせず undefined に
 // するため、ここで3値を検証しないと『undefinedへの問い合わせ』という system prompt の
 // まま検収が実行され、基準を一切読んでいないのに「全件正解」で通る（検収ゲートの偽陽性）
-const criteriaModule = await import(pathToFileURL(criteriaPath).href);
+let criteriaModule;
+try {
+  criteriaModule = await import(pathToFileURL(criteriaPath).href);
+} catch (error) {
+  // 別ファイルにフォールバックしない。それをやると「本番と違う基準で合格が出る」に戻る
+  if (error?.code === 'ERR_UNKNOWN_FILE_EXTENSION') {
+    console.error(`この Node.js（${process.version}）は TypeScript を直接読めません: ${criteriaPath}
+経路C の検収には Node.js 22.18 以上（推奨 24 LTS）が必要です。次のいずれかで再実行してください:
+  node --experimental-strip-types <このコマンド>   # Node 22.6〜22.17 ならこれで動きます
+  nvm install 24 && nvm use 24                    # nvm を使っている場合
+  brew install node@24                            # macOS + Homebrew の場合
+検収を飛ばしてデプロイに進まないこと（基準の品質を測らずに本番へ出すことになります）。`);
+    process.exit(2);
+  }
+  if (error instanceof SyntaxError) {
+    // 経路C（.ts）と経路A/B（.js）で原因が全く違うので、案内も分ける
+    const isTs = criteriaPath.endsWith('.ts');
+    console.error(
+      isTs
+        ? `判定基準を読み込めませんでした（TypeScript の構文が Node の型剥がしで扱えません）: ${criteriaPath}
+${error.message}
+判定基準は「文字列3つを持つオブジェクト」だけで書いてください。型のインポートは必ず
+  import type { ClassificationCriteria } from './claude.js';
+のように type を付けること（type が無いと実行時 import として残り、解決に失敗します）。`
+        // Node は ESM のコンパイルエラーで位置を返さない（stack は Node 内部のフレームだけで
+        // 利用者には無意味）。位置が要るなら node --check を案内するほうが確実
+        : `判定基準を読み込めませんでした（JavaScript の構文エラー）: ${criteriaPath}
+${error.message}
+バッククォートの閉じ忘れ・全角記号の混入が多いです。位置を知りたい場合は
+  node --check ${criteriaPath}
+を実行すると行番号付きで表示されます。`,
+    );
+    process.exit(1);
+  }
+  console.error(`判定基準を読み込めませんでした: ${criteriaPath}\n${error?.message ?? String(error)}`);
+  process.exit(1);
+}
 const criteria = criteriaModule.CRITERIA
   ? {
       COMPANY_NAME: criteriaModule.CRITERIA.companyName,
@@ -128,10 +195,9 @@ if (missingCriteria.length > 0) {
 // 判定は2層にする。短い語を全フィールドで部分一致させると、正当な基準の中の一般語
 // （「架空の例ではなく実案件だけを受け付ける」等）まで雛形と誤検知して検収が止まる:
 //   層1 = 雛形にしか現れない一意な文字列を、それが現れるフィールドに限定して部分一致
-//   層2 = 同梱の criteria.example.js の値そのものとの完全一致（空白の差は無視）
+//   層2 = 同梱 example（経路A/B・経路C の両方）の値そのものとの完全一致（空白差は無視）
 // 層1のマーカーは同梱 example の実文面に依存するので、example を書き換えたらここも
-// 更新すること（層2が自動で追随するのは criteria.example.js のほうだけ。
-// 経路C の criteria.example.ts は TypeScript なので import できず、層1で見ている）
+// 更新すること（層2は下の EXAMPLE_HASHES を更新する。自己点検が食い違いを警告する）
 const normalize = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 const SENTINEL_MARKERS = [
   { needle: '株式会社サンプル商事', fields: ['COMPANY_NAME', 'COMPANY_BLOCK'] }, // criteria.example.js
@@ -154,19 +220,59 @@ if (normalize(criteria.COMPANY_NAME) === 'YOUR_COMPANY_NAME') {
   foundSentinels.push('COMPANY_NAME が「YOUR_COMPANY_NAME」のままです');
 }
 // 経路A/B の LABEL_BLOCK には層1のマーカーが無く、層2だけが「例文のまま」を捕まえる。
-// example を読めないまま黙って続けると、その穴が無言で開く（原則5: 縮退には検知を対にする）
-let example = null;
-try {
-  example = await import(new URL('../templates/cloudflare-worker/src/criteria.example.js', import.meta.url).href);
-} catch (error) {
-  console.warn(`注意: criteria.example.js を読めなかったため、雛形判定を層1のみで実行します（層2スキップ: ${error.message}）。
-このリポジトリ内の tools/eval.mjs から実行すると、例文との完全一致も検証されます。`);
-}
-if (example) {
-  for (const field of ['COMPANY_NAME', 'COMPANY_BLOCK', 'LABEL_BLOCK']) {
-    if (typeof example[field] === 'string' && normalize(criteria[field]) === normalize(example[field])) {
-      foundSentinels.push(`${field} が criteria.example.js の例文のままです`);
+// 層2を「同梱 example ファイルの import」で実装すると、eval.mjs だけを別の場所にコピーした・
+// example をリネームした・example が構文エラーになった、のいずれでも層2が黙って消え、
+// 「上半分だけ書き換えた中途半端な基準」が全件正解・デプロイ可・exit 0 で通る
+// （原則5違反: 縮退には検知を対にする）。ファイル位置に依存しないよう、example 値の
+// SHA-256 を eval.mjs 自身に埋め込む。完全一致でしか発火しないので、利用者が自力で
+// 書いた正当な基準を誤検知することはない（短い語の部分一致は層1に任せる）。
+// ⚠️ criteria.example.js / criteria.example.ts の値を変えたら、下のハッシュも更新すること
+//    （example を読めたときに限り、下の自己点検が食い違いを警告する）
+const sha256 = (s) => createHash('sha256').update(normalize(s), 'utf8').digest('hex');
+const EXAMPLE_HASHES = new Set([
+  // templates/cloudflare-worker/src/criteria.example.js（経路A/B）
+  '481fd2b6e7e204ff05dfbe6906627962d737248096d7a31e5978f18eb55b8ad3', // COMPANY_NAME
+  '6b8846f5d262e0ebc6794fde50fa39601d7698c6097576a9020e3ef76f808ca8', // COMPANY_BLOCK
+  'd4406f8bc4ce59b446f65b5f1048a38dee98839a9b7481d7466aa44986a53483', // LABEL_BLOCK
+  // templates/aws-sam/src/criteria.example.ts（経路C）
+  'cdabaf3509a4e293d95eb1d7a31c9546823770528e6481effae8db3856e3a7a1', // companyName
+  '63408ac86187359f33136d973dae8479943ddd5dd9f67da2649226ed905fdf2f', // companyBlock
+  '7d79764a83f865f25a405ab407dc344eb7d27b7a47f64186f78a1039aa44902e', // labelBlock
+]);
+
+// 同梱の example を読める場合は、その実値も照合対象に足す（ハッシュが古くても層2を効かせる）。
+// 同時に、埋め込みハッシュが古くなっていないかを自己点検する
+const exampleHashes = new Set(EXAMPLE_HASHES);
+const staleExamples = [];
+let examplesRead = 0;
+for (const [rel, pick] of [
+  ['../templates/cloudflare-worker/src/criteria.example.js', (m) => [m.COMPANY_NAME, m.COMPANY_BLOCK, m.LABEL_BLOCK]],
+  ['../templates/aws-sam/src/criteria.example.ts', (m) => [m.CRITERIA?.companyName, m.CRITERIA?.companyBlock, m.CRITERIA?.labelBlock]],
+]) {
+  try {
+    const mod = await import(new URL(rel, import.meta.url).href);
+    examplesRead++;
+    for (const value of pick(mod)) {
+      if (typeof value !== 'string') continue;
+      const hash = sha256(value);
+      if (!EXAMPLE_HASHES.has(hash)) staleExamples.push(rel.split('/').pop());
+      exampleHashes.add(hash);
     }
+  } catch {
+    // 読めなくてよい（埋め込みハッシュが層2の本体。ここは自己点検の上乗せにすぎない）
+  }
+}
+if (staleExamples.length > 0) {
+  console.warn(`注意: 同梱の判定基準サンプル（${[...new Set(staleExamples)].join(', ')}）が更新されているのに、
+tools/eval.mjs の EXAMPLE_HASHES が古いままです。メンテナはハッシュを更新してください（検収は続行します）。`);
+} else if (examplesRead === 0) {
+  // 縮退そのものは無害（層2はハッシュで生きている）が、黙って進むと「ハッシュの陳腐化を
+  // 検知する手段が消えていること」に誰も気づけない（原則5: 縮退には検知を対にする）
+  console.warn('注意: 同梱の判定基準サンプルを読めなかったため、雛形判定は eval.mjs 内の埋め込みハッシュのみで実行します（判定自体は有効。リポジトリ内の tools/eval.mjs から実行すると、サンプル更新との食い違いも点検されます）。');
+}
+for (const field of ['COMPANY_NAME', 'COMPANY_BLOCK', 'LABEL_BLOCK']) {
+  if (exampleHashes.has(sha256(criteria[field]))) {
+    foundSentinels.push(`${field} が同梱の判定基準サンプル（criteria.example.*）の例文のままです`);
   }
 }
 if (foundSentinels.length > 0) {
@@ -326,10 +432,12 @@ if (errors.length === results.length) {
     for (const m of misses) {
       console.log(`・${m.file}: 正解 ${m.expected} / 判定 ${m.got} — AI の理由: ${m.reasoning}`);
     }
-    console.log(`\n基準（${criteriaPath}）に類型を追記したら、再度このスクリプトを実行してください。`);
+    console.log(`\n判定基準に類型を追記したら、再度このスクリプトを実行してください。
+追記先は ${criteriaPath} です（本番のコードが読むのもこのファイルです）。`);
   }
   if (misses.length === 0 && errors.length === 0) {
-    console.log(`\n全件正解です（判定基準: ${criteriaPath}）。samples/ を削除して、デプロイに進んでください。`);
+    console.log(`\n全件正解です（判定基準: ${criteriaPath} — 本番のコードが読むのと同じファイル）。
+samples/ を削除して、デプロイに進んでください。`);
   }
 }
 console.log('\n※ この検収は判定基準の品質を測る簡易評価です。本番の分類には few-shot 例・会社名等の文脈が加わるため、結果は完全一致しません。');

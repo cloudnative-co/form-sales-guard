@@ -298,14 +298,24 @@ Resources:
   # （PITFALLS F-2: ランタイムのログ形式変更で壊れない）。文字列はアプリログとの
   # 「契約」であり、ログ文言をリファクタするとアラームが無音化する（PITFALLS F-1）。
   # ---------------------------------------------------------------------------
+  # DeletionPolicy: Retain は「既に Lambda が自動作成したロググループを持つ運用中スタックへ
+  # あとから取り込む（auto-import）」ための要件。CloudFormation の auto-import は対象リソースが
+  # Retain か RetainExceptOnCreate であることを要求する（AWS 公式）。これが無いと、既存スタックの
+  # 更新時に `already exists` を避ける手段が「ログを消す」しか無くなる（README 手順5）。
+  # 副作用: `sam delete` してもロググループは残る。完全に片付けるなら
+  # `aws logs delete-log-group` を手で実行すること（RetentionInDays の設定は残るので放置しても消える）
   ProcessorLogGroup:
     Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       LogGroupName: /aws/lambda/form-guard-processor
       RetentionInDays: 90
 
   ClassifierLogGroup:
     Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       LogGroupName: /aws/lambda/form-guard-classifier
       RetentionInDays: 90
@@ -461,14 +471,118 @@ Resources:
       OKActions:
         - !Ref AlarmTopic
 
-  # ソースキュー滞留の検知。イベントソースマッピング停止・processor の継続的な障害では
-  # 受信カウントが増えず DLQ アラームに乗らないまま、メッセージが保持期限（4日）切れで
-  # 消失する。最古メッセージの滞留時間で「処理が進んでいない」ことを直接検知する
+  # processor の実行失敗の検知。processor の内部エラーの多くは catch → error ログ →
+  # 上のメトリクスフィルタが拾う設計だが、getConfig/getSecrets の失敗・タイムアウト・
+  # OOM・初期化エラー・再 throw は catch の外にあり、ログ文字列にも乗らない。
+  # ⚠️ このアラームが無いと、失敗し続けるメッセージ（poison pill）の検知が実質 DLQ 到達
+  # （6回目の受信＝約60分後）まで遅れる。標準キューは「3回以上受信されて削除されない
+  # メッセージをキュー末尾に移動し ApproximateAgeOfOldestMessage の対象から外す」ため
+  # （AWS 公式・redrive policy があっても同じ）、VisibilityTimeout=720 だと受信#3 は
+  # 滞留24分で、下の QueueAgeAlarm の30分閾値に届く前に対象外になる。
+  # 「5分枠のうち2枠でエラー」= M-out-of-N（EvaluationPeriods 6 / DatapointsToAlarm 2）に
+  # しているのは、単発で自己回復するエラー（一時的な Secrets Manager 失敗・コールドスタート等）
+  # で鳴らさないため。
+  # ⚠️ 「15分枠でエラー2回」（Period 900 / Threshold 2）にしてはいけない: CloudWatch の
+  # 評価枠は絶対時刻に整列するので、12分間隔の再試行は枠をまたぎ続けることがあり
+  # （例: 14分・26分・38分…はどれも別の15分枠）、本物の poison pill でも永久に鳴らない。
+  # M-out-of-N なら 30分の観測窓に2枠入ればよいので、受信#1(0分) と #2(12分) で
+  # 約15分後に発火する＝年齢メトリクスから外れる受信#3(24分) より前に検知できる。
+  # 既存アラームと形が違うのはこの理由。ノイズで通知を切られると、サイレント劣化を
+  # 検知する ClassificationFailureAlarm ごと無音化するため、鳴らしすぎも危険
+  ProcessorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: form-guard-processor-errors
+      AlarmDescription: Processor Lambda invocations are failing repeatedly - such messages drop out of the queue-age alarm once received 3+ times
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 6
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  # 受付ハンドラ（classifier）の catch 外の失敗の検知。ClassifierErrorMetricFilter は
+  # log.error('Handler error') 文字列を見るが、getConfig() は try の外にあり、
+  # タイムアウト・OOM・初期化エラー・バンドル不良も同様に catch に入らない。
+  # これらが起きると全ての /submit が 502 になる＝フォームが完全に止まるのに、
+  # 運用者には何も飛ばない状態だった（送信者にはエラーが見えるので消失ではないが、
+  # 止まっていることを運用者が知る手段がゼロ）。poison pill 1件より被害が大きい
+  ClassifierLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: form-guard-classifier-lambda-errors
+      AlarmDescription: Classifier Lambda is failing outside its try/catch (config, init, timeout, OOM) - the form is returning 502
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ClassifierFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  # 壊れた SQS メッセージの検知。processor は JSON パース不能・構造不正のメッセージを
+  # skip（continue）するため、handler は正常終了し SQS はメッセージを削除する。
+  # つまり DLQ にも Errors にも滞留アラームにも乗らず、受付済みの問い合わせが
+  # DynamoDB に status:received のまま無音で取り残される。classifier と processor の
+  # メッセージ形式がずれる片側デプロイでは全件がここに落ちるので、検知を必ず対にする
+  # （安全不変条件5。捨てる前提の分岐こそ検知が要る）
+  MalformedMessageMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ProcessorLogGroup
+      FilterPattern: '?"Invalid JSON in SQS message" ?"Invalid SQS message structure"'
+      MetricTransformations:
+        - MetricName: MalformedMessages
+          MetricNamespace: FormGuard
+          MetricValue: '1'
+          DefaultValue: 0
+
+  MalformedMessageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: form-guard-malformed-messages
+      AlarmDescription: Processor skipped an unparseable SQS message - the submission stays 'received' in DynamoDB with no notification
+      Namespace: FormGuard
+      MetricName: MalformedMessages
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  # ソースキュー滞留の検知。イベントソースマッピングの停止・削除、ReceiveMessage 権限の
+  # 剥奪など「受信カウントが増えないまま処理が止まる」障害を、最古メッセージの滞留時間で
+  # 直接検知する（放置するとメッセージは保持期限4日で消える）。
+  # ⚠️ 「関数が失敗し続ける」ケースはこのアラームでは検知できない（上の ProcessorErrorAlarm
+  # のコメント参照）。役割が違う2本なので、どちらも消さないこと
   QueueAgeAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: form-guard-queue-age
-      AlarmDescription: Oldest message in processing queue is older than 30 minutes - processing may be stalled (event source disabled, throttled, or failing before DLQ)
+      AlarmDescription: Oldest message in processing queue is older than 30 minutes - polling has stopped (event source disabled or permissions revoked)
       Namespace: AWS/SQS
       MetricName: ApproximateAgeOfOldestMessage
       Dimensions:
