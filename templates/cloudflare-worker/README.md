@@ -39,6 +39,11 @@ SPAM         → 通知なし・KV に隔離（/quarantine で一覧・救出）
 - **記録先の追加**: `processSubmission()` に追記（Google Sheets / Notion 等）。内蔵 KV 記録は隔離ボックスと few-shot の基盤なので**残す**
 - **モデル変更**: `wrangler.toml` の `MODEL` のみ（コードは触らない）
 
+## 既知の限界（低流量・操作者1名を前提にした単純化）
+
+- **修正処理は原子的でない**: Workers KV は read-modify-write のトランザクションを持たないため、複数人がほぼ同時に同じ通知の修正リンクを実行すると、矛盾した few-shot 例（`correction:` キー）が両方残りうる。起きたら隔離ボックス・`wrangler kv key list` で該当 `correction:` キーを削除すれば直る。操作者が実質1名の運用では問題にならない
+- **修正・隔離リンクに有効期限はない**: リンクは Slack 内部にのみ流れる前提。万一 URL が外部に漏れた場合は `CORRECTION_SECRET` を再生成して再デプロイすれば全リンクが失効する
+
 ## 変えてはいけないもの
 
 `docs/DESIGN_PRINCIPLES.md` の7原則に対応する箇所（`src/index.js` 冒頭のコメントに対応表あり）。
