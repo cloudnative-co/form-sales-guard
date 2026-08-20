@@ -1,0 +1,431 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  form-sales-guard 経路C: AWS 参照実装（雛形）。
+  API Gateway + 同期 Classifier Lambda + SQS/DLQ + 非同期 Processor Lambda +
+  Slack Feedback Lambda + DynamoDB 記録 + CloudWatch 検知アラーム。
+  そのままデプロイする完成品ではなく、設計判断を読み取るための参照実装。
+
+Globals:
+  Function:
+    # 同期系（classifier/feedback）は API Gateway の統合タイムアウト既定 29 秒より
+    # 短くする（PITFALLS B-2）。29 秒を超えると、ゲートウェイが 504 を返した後に
+    # Lambda が処理を完遂し、クライアント再送と合わさって重複レコード・重複通知を生む。
+    # processor は SQS 起動（API GW を経由しない）なので個別に 120 秒を指定している。
+    Timeout: 25
+    Runtime: nodejs22.x
+    MemorySize: 256
+
+Parameters:
+  SecretsArn:
+    Type: String
+    Description: >-
+      Secrets Manager シークレットの ARN。JSON で ANTHROPIC_API_KEY /
+      SLACK_BOT_TOKEN / SLACK_SIGNING_SECRET を格納する。
+      シークレットを Lambda 環境変数に直接置かないための構成。
+  AllowedOrigin:
+    Type: String
+    Default: 'https://www.example.com'
+    Description: >-
+      CORS で許可するオリジン（単一のみ）。この値は API Gateway の
+      AllowOrigin ヘッダーにそのまま埋め込まれるため、カンマ区切りの
+      複数指定は不正なプリフライト応答になる。
+  SlackChannelLeads:
+    Type: String
+    Default: 'YOUR_SLACK_CHANNEL_ID_LEADS'
+    Description: LEAD 通知先の Slack チャンネル ID
+  SlackChannelReview:
+    Type: String
+    Default: 'YOUR_SLACK_CHANNEL_ID_REVIEW'
+    Description: REVIEW（要人間確認）通知先の Slack チャンネル ID
+  SlackChannelSpam:
+    Type: String
+    Default: 'YOUR_SLACK_CHANNEL_ID_SPAM'
+    Description: >-
+      SPAM 通知先の Slack チャンネル ID。SPAM も通知先を分けて必ず流す
+      （安全不変条件 2: 削除ではなく隔離。人間がいつでも一覧・救出できる導線を残す）。
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: アラーム通知を受けるメールアドレス（空なら購読をスキップ）
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # SQS: 即応答（同期）と AI 分類（非同期）を分離する要（安全不変条件 3）
+  # Lambda では fire-and-forget（handler return 後の処理続行）が実行環境の凍結で
+  # 消えるため（PITFALLS B-1）、キュー渡しが「裏で処理」の唯一の正解になる。
+  # ---------------------------------------------------------------------------
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: form-guard-processing-queue
+      # AWS 推奨: Lambda イベントソースでは関数タイムアウト（processor 120s）の
+      # 6 倍以上（PITFALLS C-2）。短いと処理中のメッセージが再配信され、
+      # 確認済みの通知・記録が重複実行される。
+      VisibilityTimeout: 720
+      # ソースキューは 4 日保持（PITFALLS C-4）: イベントソース停止などの長期障害時に、
+      # 未処理メッセージが DLQ を経由せず既定の保持期限切れで消失するのを防ぐ。
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ProcessingDLQ.Arn
+        # AWS 推奨最低値 5（PITFALLS C-3）: 一時的なスロットルでも受信カウントは
+        # 加算されるため、小さい値だと正常なメッセージが早期に DLQ 送りになる。
+        maxReceiveCount: 5
+
+  ProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: form-guard-processing-dlq
+      # DLQ は 14 日保持（PITFALLS C-4）。「期限内に対応しないと消える」ことを
+      # 運用手順に明記すること。redrive（再投入）は非冪等リスクを伴うため、
+      # 再投入前に「どこまで成功していたか」の確認を必須とする（PITFALLS C-5）。
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  # ---------------------------------------------------------------------------
+  # 記録先: DynamoDB（雛形での例示。Notion / CRM 等への差し替えは README 参照）
+  # SPAM を含む全レコードを保存する = 隔離ボックスの実体（安全不変条件 2）
+  # ---------------------------------------------------------------------------
+  RecordsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: form-guard-records
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: recordId
+          AttributeType: S
+        - AttributeName: slackMessageTs
+          AttributeType: S
+        - AttributeName: feedbackPartition
+          AttributeType: S
+        - AttributeName: correctedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: recordId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        # Slack メッセージ ts → レコードの逆引き。修正ボタンの value に埋めた ID を
+        # そのまま信用せず、実レコードと突合するために必須（IDOR 対策、PITFALLS D-3）
+        - IndexName: SlackTsIndex
+          KeySchema:
+            - AttributeName: slackMessageTs
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        # 人間が修正したレコードだけを引く few-shot 用インデックス。
+        # 固定値パーティション（"corrected"）は大規模ではアンチパターンだが、
+        # フォーム営業の修正件数（月数件）ではこの単純さが正しい。
+        - IndexName: CorrectedIndex
+          KeySchema:
+            - AttributeName: feedbackPartition
+              KeyType: HASH
+            - AttributeName: correctedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # ---------------------------------------------------------------------------
+  # 同期 Lambda: フォーム受信 → 検証 → 保存 → SQS 送信 → 即 200
+  # ---------------------------------------------------------------------------
+  ClassifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: form-guard-classifier
+      Handler: classifier.handler
+      CodeUri: ./
+      Description: Receives form, validates (honeypot/timestamp/limits), saves record, queues for async processing
+      Environment:
+        Variables:
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+          QUEUE_URL: !Ref ProcessingQueue
+          TABLE_NAME: !Ref RecordsTable
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ProcessingQueue.QueueName
+        - DynamoDBWritePolicy:
+            TableName: !Ref RecordsTable
+      Events:
+        SubmitApi:
+          Type: Api
+          Properties:
+            Path: /submit
+            Method: POST
+            RestApiId: !Ref FormGuardApi
+        SubmitOptions:
+          Type: Api
+          Properties:
+            Path: /submit
+            Method: OPTIONS
+            RestApiId: !Ref FormGuardApi
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: 'es2022'
+        EntryPoints:
+          - src/classifier.ts
+        External:
+          - '@aws-sdk/*'
+
+  # ---------------------------------------------------------------------------
+  # 非同期 Lambda: few-shot 取得 → AI 分類 → 記録更新・Slack 通知（never-reject）
+  # ---------------------------------------------------------------------------
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: form-guard-processor
+      Handler: processor.handler
+      # SQS 起動なので API GW の 29 秒制約を受けない。AI API のクライアント
+      # タイムアウト（60s、claude.ts 参照）より長く取る（タイムアウトの階層）。
+      Timeout: 120
+      CodeUri: ./
+      Description: Classifies queued submissions with AI, updates record, notifies Slack
+      Environment:
+        Variables:
+          SECRETS_ARN: !Ref SecretsArn
+          TABLE_NAME: !Ref RecordsTable
+          SLACK_CHANNEL_LEADS: !Ref SlackChannelLeads
+          SLACK_CHANNEL_REVIEW: !Ref SlackChannelReview
+          SLACK_CHANNEL_SPAM: !Ref SlackChannelSpam
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RecordsTable
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref SecretsArn
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ProcessingQueue.Arn
+            BatchSize: 1
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: 'es2022'
+        EntryPoints:
+          - src/processor.ts
+        External:
+          - '@aws-sdk/*'
+
+  # ---------------------------------------------------------------------------
+  # Slack Feedback Lambda: 修正ボタン → 署名検証 → IDOR 突合 → 人間ラベル記録
+  # ---------------------------------------------------------------------------
+  FeedbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: form-guard-feedback
+      Handler: feedback.handler
+      CodeUri: ./
+      Description: Handles Slack correction buttons (signature verification, IDOR check, human label recording)
+      Environment:
+        Variables:
+          SECRETS_ARN: !Ref SecretsArn
+          TABLE_NAME: !Ref RecordsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RecordsTable
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref SecretsArn
+      Events:
+        SlackActionsApi:
+          Type: Api
+          Properties:
+            Path: /slack/actions
+            Method: POST
+            RestApiId: !Ref FormGuardApi
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: 'es2022'
+        EntryPoints:
+          - src/feedback.ts
+        External:
+          - '@aws-sdk/*'
+
+  # ---------------------------------------------------------------------------
+  # 検知: fail-open は「無音で壊れる」ため、検知を必ず対にする（安全不変条件 5）
+  #
+  # processor の下流（Slack 通知・記録更新）は失敗を catch 内で error ログに落とし
+  # throw しない（never-reject、PITFALLS C-1: SQS リトライによる通知再送等の
+  # 非冪等な二重実行を避けるため）。その結果 DLQ にもアラームにも自然には乗らない
+  # ので、ログ文字列のメトリクスフィルタがこれらの失敗の唯一の検知手段になる。
+  #
+  # FilterPattern はログが JSON 構造化されていてもプレーン文字列でマッチさせる
+  # （PITFALLS F-2: ランタイムのログ形式変更で壊れない）。文字列はアプリログとの
+  # 「契約」であり、ログ文言をリファクタするとアラームが無音化する（PITFALLS F-1）。
+  # ---------------------------------------------------------------------------
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/form-guard-processor
+      RetentionInDays: 90
+
+  # AI 分類失敗の検知。classifyContact の catch は失敗を握りつぶして REVIEW を
+  # 返す（fail-open）ため、このアラームがサイレント劣化（モデル引退・API 変更等）の
+  # 唯一の検知手段（PITFALLS A-1: 当社本番で実際に起きた「静かな全滅」）。
+  ClassificationFailureMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ProcessorLogGroup
+      FilterPattern: '"Classification failed"'
+      MetricTransformations:
+        - MetricName: ClassificationFailures
+          MetricNamespace: FormGuard
+          MetricValue: '1'
+          DefaultValue: 0
+
+  ClassificationFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: form-guard-classification-failures
+      AlarmDescription: AI classification failed (silent REVIEW fallback) - processor logged 'Classification failed'
+      Namespace: FormGuard
+      MetricName: ClassificationFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  # Slack 通知失敗の検知（一次通知チャネル消失はここでのみ検知可能）
+  SlackPostFailureMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ProcessorLogGroup
+      FilterPattern: '"Slack post failed"'
+      MetricTransformations:
+        - MetricName: SlackPostFailures
+          MetricNamespace: FormGuard
+          MetricValue: '1'
+          DefaultValue: 0
+
+  SlackPostFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: form-guard-slack-post-failures
+      AlarmDescription: Slack notification failed - processor logged 'Slack post failed'
+      Namespace: FormGuard
+      MetricName: SlackPostFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  # 記録更新失敗の検知（失敗すると「分類ラベルなしのまま Slack 通知だけ完了」という
+  # データ不整合がサイレントに発生するため）
+  RecordUpdateFailureMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ProcessorLogGroup
+      FilterPattern: '"Failed to update classification"'
+      MetricTransformations:
+        - MetricName: RecordUpdateFailures
+          MetricNamespace: FormGuard
+          MetricValue: '1'
+          DefaultValue: 0
+
+  RecordUpdateFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: form-guard-record-update-failures
+      AlarmDescription: Record classification update failed - processor logged 'Failed to update classification'
+      Namespace: FormGuard
+      MetricName: RecordUpdateFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  # DLQ 到達 = 未処理の問い合わせの検知（processor 自体の異常終了・infra 障害）
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: form-guard-dlq-messages
+      AlarmDescription: Messages in processing DLQ - unprocessed form submissions
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ProcessingDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: form-guard-alarms
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # ---------------------------------------------------------------------------
+  # API Gateway（スロットリングでフォーム連打・攻撃面を抑える）
+  # ---------------------------------------------------------------------------
+  FormGuardApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: form-guard-api
+      StageName: prod
+      MethodSettings:
+        - HttpMethod: '*'
+          ResourcePath: '/*'
+          ThrottlingRateLimit: 10
+          ThrottlingBurstLimit: 20
+      Cors:
+        AllowMethods: "'POST, OPTIONS'"
+        AllowHeaders: "'Content-Type'"
+        AllowOrigin: !Sub "'${AllowedOrigin}'"
+
+Outputs:
+  SubmitEndpoint:
+    Description: フォーム送信エンドポイント
+    Value: !Sub 'https://${FormGuardApi}.execute-api.${AWS::Region}.amazonaws.com/prod/submit'
+  SlackActionsEndpoint:
+    Description: Slack Interactivity の Request URL に設定するエンドポイント
+    Value: !Sub 'https://${FormGuardApi}.execute-api.${AWS::Region}.amazonaws.com/prod/slack/actions'
+  ProcessingQueueUrl:
+    Description: 非同期処理キューの URL
+    Value: !Ref ProcessingQueue
+  ProcessingDLQUrl:
+    Description: DLQ の URL（redrive 前に PITFALLS C-5 を必ず読むこと）
+    Value: !Ref ProcessingDLQ

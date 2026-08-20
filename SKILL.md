@@ -55,8 +55,8 @@ description: お問い合わせフォームに届く営業スパム（フォー�
 | 条件 | 経路 |
 |---|---|
 | フォームを新規に作る／自作フォームの送信先を変えられる | **A: Cloudflare Worker 単体構成**（[templates/cloudflare-worker/](templates/cloudflare-worker/)） |
-| 既存フォーム（SaaS・WordPress）に手を入れたくない／入れられない | **B: メール転送方式**（フォームの通知メールを転送して分類。[templates/email-routing/](templates/email-routing/) — 準備中。準備中の間は、通知メールの転送先を経路Aの Worker に POST する中継で代替可能か検討する） |
-| 利用者がエンジニアで AWS を希望 | **C: AWS 参照実装**（[templates/aws-sam/](templates/aws-sam/) — 準備中） |
+| 既存フォーム（SaaS・WordPress）に手を入れたくない／入れられない | **B: メール転送方式**（フォームの通知メールを転送して分類。[templates/email-routing/](templates/email-routing/)。前提: 独自ドメインのゾーンが Cloudflare にあること） |
+| 利用者がエンジニアで AWS を希望 | **C: AWS 参照実装**（[templates/aws-sam/](templates/aws-sam/)。そのままデプロイする完成品ではなく設計参照の雛形 — 同ディレクトリの README に従う） |
 
 迷ったら A を選ぶ。以下、本手順書は経路 A を主線として書く（B/C はテンプレート内の README に従う）。
 
@@ -82,6 +82,7 @@ description: お問い合わせフォームに届く営業スパム（フォー�
 2. Q2 の通知先に合わせて通知関数を調整（既定は Slack Incoming Webhook。メールの場合は Resend 等の送信 API を提案し、無料枠と登録手順を案内）
 3. Q3 で (b)(c) を選んだ場合は記録アダプタを追加（内蔵 KV 記録は残す — 隔離ボックスと few-shot の基盤のため）
 4. フォーム側の送信先を Worker の `/submit` に向ける変更を案内（経路 Aの場合）。フォームがまだ無い場合はテストフォーム（`TEST_FORM` フラグ）を本番フォームの雛形として提供
+5. コピー先プロジェクトに、テンプレート同梱の `.gitignore`（`criteria.js` を除外する）が入っていることを確認する。判定基準は機微情報であり、利用者が誤って公開リポジトリに push しない構造を保つ
 
 **実装調整時の必須確認**: [DESIGN_PRINCIPLES.md](docs/DESIGN_PRINCIPLES.md) の7原則をテンプレートは満たしている。**調整の過程でこれを壊さない**こと。特に: 分類の try/catch と REVIEW フォールバックを削らない、`ctx.waitUntil` を同期処理に変えない、SPAM の記録保存をスキップしない。
 
@@ -99,9 +100,14 @@ description: お問い合わせフォームに届く営業スパム（フォー�
    npx wrangler secret put CORRECTION_SECRET   # ランダム生成して設定（openssl rand -hex 32 等）
    npx wrangler deploy
    ```
-4. **費用の上限設定（スキップ禁止 — 安全不変条件7）**: Anthropic Console の利用上限（想定月額の3〜5倍）と、Cloudflare / AWS の費用通知の設定を、画面の場所を案内しながら一緒に行う
+4. **デプロイ後の仕上げ（スキップするとリンクが壊れる）**:
+   - deploy で表示された URL を `wrangler.toml` の `PUBLIC_URL` に設定して**再デプロイ**（未設定だと通知内の修正リンクが壊れる）
+   - 隔離ボックスの URL を生成して利用者に渡す（ブックマークを推奨）: `<PUBLIC_URL>/quarantine?sig=<署名>`。署名は `HMAC-SHA256(CORRECTION_SECRET, "quarantine")` の16進表現
+5. **費用の上限設定（スキップ禁止 — 安全不変条件7）**: Anthropic Console の利用上限（想定月額の3〜5倍）と、Cloudflare / AWS の費用通知の設定を、画面の場所を案内しながら一緒に行う
 
 ## Step 5: 動作検証（必ず利用者と一緒に行う）
+
+※ 以下は経路Aの手順。**経路B/C を選んだ場合は各テンプレート README の検証手順に読み替える**（例: 経路B に honeypot・3秒チェックは無い / 経路C の隔離ボックスは SPAM チャンネル + DynamoDB、修正は Slack ボタン）。
 
 1. **本物らしいテスト送信**: 正当な問い合わせ文でフォーム送信 → LEAD 通知が届くこと
 2. **営業らしいテスト送信**: Step 2 で貼られたものに似た営業文（あなたが架空に作成）で送信 → SPAM として通知されず、隔離ボックス（`/quarantine` の署名付きリンク）に入ること
@@ -115,7 +121,7 @@ description: お問い合わせフォームに届く営業スパム（フォー�
 
 ## Step 6: 完成チェックリストと引き継ぎ
 
-完了宣言の前に、生成した実装が以下を満たすことを確認して利用者に報告する:
+完了宣言の前に、生成した実装が以下を満たすことを確認して利用者に報告する（経路B/C では各テンプレート README の対応する仕組みに読み替える）。あわせて経路Aでは本番化を忘れない: `ALLOWED_ORIGIN` を本番フォームのオリジンに設定し、`TEST_FORM = "false"` にして再デプロイする。
 
 - [ ] 分類失敗が REVIEW に落ちる（fail-open）
 - [ ] SPAM が削除されず、隔離ボックスで一覧・救出できる

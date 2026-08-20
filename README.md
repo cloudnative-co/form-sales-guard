@@ -15,6 +15,8 @@
 
 ## はじめかた（3ステップ）
 
+必要なもの: **Claude Code**（利用プランが必要）/ **Anthropic API キー**（従量課金・カード登録が必要。月100件なら数百円程度）/ **Cloudflare アカウント**（無料）。
+
 1. **Claude Code を用意する** — 初めての方は [claude-code-starter-kit](https://github.com/cloudnative-co/claude-code-starter-kit) の対話型ウィザードで環境を作れます
 2. **次の1行を Claude Code に貼る**
 
@@ -36,8 +38,9 @@
 | [docs/COSTS.md](docs/COSTS.md) | 費用の実測と見積り（AI API・インフラ別、流量別） |
 | [prompts/classifier-skeleton.md](prompts/classifier-skeleton.md) | 分類プロンプトの構造と「あなた専用の判定基準」の作らせ方 |
 | [templates/cloudflare-worker/](templates/cloudflare-worker/) | 経路A: Cloudflare Worker 単体構成（初心者向けデフォルト） |
-| [templates/email-routing/](templates/email-routing/) | 経路B: メール転送方式 —— 既存フォームを一切変えずに導入（準備中） |
-| [templates/aws-sam/](templates/aws-sam/) | 経路C: AWS 参照実装 —— 当社が実運用している構成（準備中） |
+| [templates/email-routing/](templates/email-routing/) | 経路B: メール転送方式 —— 既存フォームを一切変えずに導入（通知メールを転送するだけ） |
+| [templates/aws-sam/](templates/aws-sam/) | 経路C: AWS 参照実装 —— 当社が実運用している構成のサニタイズ版（エンジニア向け雛形） |
+| [site/](site/) | 公開サイト（[form-sales-guard.cn-shinji.workers.dev](https://form-sales-guard.cn-shinji.workers.dev)）のソース |
 
 ## 大事な注意
 

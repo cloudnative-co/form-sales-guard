@@ -1,0 +1,5 @@
+# 判定基準は機微情報（自社に届いた営業の観測から生成）。公開リポジトリに入れない
+criteria.js
+node_modules/
+.wrangler/
+.dev.vars

@@ -1,0 +1,37 @@
+# フォーム営業撲滅AI — 経路B: メール転送方式の設定
+#
+# 前提: 独自ドメインのゾーンが Cloudflare にあること（Email Routing の要件）
+#
+# セットアップ手順:
+#   0. ../cloudflare-worker/src/criteria.example.js を参考に src/criteria.js を生成する
+#      （SKILL.md Step 2。このファイルが無いと手順6のデプロイがモジュール解決エラーで失敗する）
+#   1. Cloudflare ダッシュボード → 対象ドメイン → Email → Email Routing を有効化
+#   2. 「宛先アドレス」に本来の受信先（例: info@あなたのドメイン の転送先）を追加して確認メールを承認
+#   3. フォーム専用の受信アドレス（例: form-guard@あなたのドメイン）を作成
+#   4. npx wrangler kv namespace create RECORDS → id を下に貼る
+#   5. npx wrangler secret put ANTHROPIC_API_KEY
+#      npx wrangler secret put CORRECTION_SECRET   （openssl rand -hex 32 等で生成）
+#      npx wrangler secret put SLACK_WEBHOOK_URL   （任意）
+#      npx wrangler secret put SLACK_WEBHOOK_SPAM  （任意・SPAM を別チャンネルにも流す場合）
+#   6. npx wrangler deploy
+#   7. Email Routing のルーティングルールで「form-guard@... → Send to a Worker → このWorker」を設定
+#   8. フォームサービス側の通知先メールアドレスを form-guard@... に変更（フォーム自体の改修は不要）
+
+name = "form-sales-guard-mail"
+main = "src/email-worker.js"
+compatibility_date = "2026-08-01"
+
+[vars]
+# モデル ID は 1 箇所に集約（docs/PITFALLS.md A-1）
+MODEL = "claude-sonnet-5"
+# 分類後の転送先（Email Routing で検証済みのアドレスであること）
+DESTINATION_ADDRESS = "you@example.com"
+# フォーム通知メールの差出人に含まれる文字列（例: "noreply@form-service.example"）。
+# 設定すると、これ以外の差出人からのメールは分類せず素通しで転送する。空なら全メールを分類
+FORM_SENDER = ""
+# デプロイ後の Worker の URL（救出リンクの生成に使う）
+PUBLIC_URL = ""
+
+[[kv_namespaces]]
+binding = "RECORDS"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"

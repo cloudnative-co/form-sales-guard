@@ -1,0 +1,8 @@
+# フォーム営業撲滅AI — 公開サイト（Cloudflare Workers Static Assets）
+# デプロイ: cd site && npx wrangler deploy
+
+name = "form-sales-guard"
+compatibility_date = "2026-08-01"
+
+[assets]
+directory = "./public"

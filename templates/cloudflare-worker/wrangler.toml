@@ -7,7 +7,7 @@
 #   4. npx wrangler secret put SLACK_WEBHOOK_URL   （通知先。SPAM 専用は SLACK_WEBHOOK_SPAM・任意）
 #   5. npx wrangler deploy
 
-name = "form-sales-guard"
+name = "form-guard-worker"
 main = "src/index.js"
 compatibility_date = "2026-08-01"
 

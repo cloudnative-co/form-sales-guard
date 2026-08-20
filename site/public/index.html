@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>フォーム営業撲滅AI | 株式会社クラウドネイティブ</title>
+<meta name="description" content="お問い合わせフォームに届く営業スパムをAIが自動で仕分ける仕組みを、Claude Codeで自分の環境に構築できる無料公開レシピ。運用6ヶ月・AI分類494件・リード取りこぼし検知0件の実績に基づく設計と費用データを公開。">
+<meta property="og:type" content="website">
+<meta property="og:title" content="フォーム営業撲滅AI">
+<meta property="og:description" content="撲滅されるのは、営業文面を読むあなたの時間です。AIによる問い合わせ自動仕分けを、1行貼るだけで自分の環境に構築できる公開レシピ。">
+<meta property="og:site_name" content="フォーム営業撲滅AI">
+<meta property="og:locale" content="ja_JP">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='14' fill='%23b71c1c'/><text x='50' y='68' font-size='52' text-anchor='middle' fill='white' font-family='serif' font-weight='bold'>撲</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Shippori+Mincho+B1:wght@600;700;800&family=Zen+Kaku+Gothic+New:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --washi: #f7f3ec;
+    --washi-deep: #efe8dc;
+    --ink: #211d1a;
+    --ink-soft: #5f5850;
+    --shu: #bc0000; /* 公式カラー（cloudnative.co.jp/brand/） */
+    --shu-bright: #d32121;
+    --line: #d9cfc0;
+    --lead: #2e6b34;
+    --review: #9a6200;
+    --spam: #75695f;
+    --mincho: "Shippori Mincho B1", "Hiragino Mincho ProN", serif;
+    --gothic: "Zen Kaku Gothic New", "Hiragino Sans", sans-serif;
+    --mono: "IBM Plex Mono", "Menlo", monospace;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1200px 600px at 85% -5%, rgba(183,28,28,.05), transparent 60%),
+      repeating-linear-gradient(0deg, transparent 0 2px, rgba(33,29,26,.012) 2px 3px),
+      var(--washi);
+    color: var(--ink);
+    font-family: var(--gothic);
+    font-size: 16px;
+    line-height: 2;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--shu); color: #fff; }
+  a { color: var(--shu); text-underline-offset: 4px; text-decoration-thickness: 1px; }
+  a:hover { color: var(--shu-bright); }
+  :focus-visible { outline: 3px solid var(--shu); outline-offset: 3px; border-radius: 2px; }
+
+  .wrap { max-width: 44rem; margin: 0 auto; padding: 0 1.4rem; }
+
+  /* ---- 縦書きレール（セクション番号） ---- */
+  section { position: relative; padding: 5.5rem 0 1rem; }
+  .rail {
+    position: absolute; top: 6rem; left: -4.6rem;
+    writing-mode: vertical-rl;
+    font-family: var(--mincho); font-weight: 700; font-size: .82rem;
+    letter-spacing: .5em; color: var(--shu);
+    border-left: 1px solid var(--line); padding-left: .9rem;
+  }
+  @media (max-width: 1120px) { .rail { position: static; writing-mode: horizontal-tb; border: 0; padding: 0; letter-spacing: .35em; margin-bottom: .6rem; } }
+
+  h2 {
+    font-family: var(--mincho); font-weight: 800;
+    font-size: clamp(1.7rem, 4.5vw, 2.3rem); line-height: 1.5;
+    margin: 0 0 1.6rem; letter-spacing: .02em; text-wrap: balance;
+  }
+  h3 { font-family: var(--mincho); font-weight: 700; font-size: 1.15rem; margin: 2.4rem 0 .8rem; }
+  p { margin: 0 0 1.2rem; }
+  strong { font-weight: 700; }
+  em { font-style: normal; background: linear-gradient(transparent 62%, rgba(183,28,28,.18) 62%); }
+
+  /* ---- ブランドバー（ロゴは無改変・アイソレーション確保） ---- */
+  .topbar { padding: 1.2rem 0 0; }
+  .topbar .brand { display: inline-block; padding: .6rem 0; }
+  .topbar img { display: block; height: 26px; width: auto; }
+
+  /* ---- ヒーロー ---- */
+  header.hero { position: relative; padding: clamp(3rem, 8vh, 5.5rem) 0 4rem; overflow: hidden; }
+  .hero-tate {
+    position: absolute; top: 3rem; right: max(1rem, calc(50% - 24rem));
+    writing-mode: vertical-rl; font-family: var(--mincho); font-weight: 700;
+    font-size: .85rem; letter-spacing: .42em; color: var(--ink-soft);
+  }
+  .hero h1 {
+    font-family: var(--mincho); font-weight: 800;
+    font-size: clamp(2.9rem, 10vw, 5.4rem); line-height: 1.28;
+    letter-spacing: .015em; margin: 0 0 1.8rem; text-wrap: balance;
+  }
+  .hero h1 .bokumetsu { color: var(--shu); }
+  .hero h1 .small { display: block; font-size: .34em; font-weight: 700; letter-spacing: .28em; color: var(--ink-soft); margin-bottom: 1.4em; }
+  .hero .define {
+    font-size: 1.02rem; max-width: 36rem;
+    border-left: 3px solid var(--shu); padding: .3rem 0 .3rem 1.2rem; margin-bottom: 2.4rem;
+  }
+  .hanko {
+    display: inline-grid; place-items: center;
+    width: 5.4rem; height: 5.4rem; border-radius: 50%;
+    border: 3px solid var(--shu); color: var(--shu);
+    font-family: var(--mincho); font-weight: 800; font-size: 1.5rem; line-height: 1.3;
+    transform: rotate(-8deg); text-align: center;
+    position: absolute; top: clamp(3rem, 8vh, 5.5rem); right: max(4.5rem, calc(50% - 20rem));
+    opacity: .92; user-select: none;
+  }
+  @media (max-width: 720px) { .hanko { display: none; } .hero-tate { display: none; } }
+
+  .cta-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, max-content)); gap: .9rem; margin-top: 1rem; }
+  .btn {
+    display: inline-block; font-weight: 700; font-size: .95rem;
+    padding: .85rem 1.7rem; border-radius: 3px; text-decoration: none;
+    transition: transform .15s ease, box-shadow .15s ease;
+  }
+  .btn-shu { background: var(--shu); color: #fff; box-shadow: 3px 3px 0 rgba(33,29,26,.85); }
+  .btn-shu:hover { color: #fff; transform: translate(-1px,-1px); box-shadow: 4px 4px 0 rgba(33,29,26,.85); }
+  .btn-ink { border: 1.5px solid var(--ink); color: var(--ink); background: transparent; }
+  .btn-ink:hover { color: var(--shu); border-color: var(--shu); }
+
+  /* ---- 大数字 ---- */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); margin: 2.2rem 0; }
+  .stat { background: var(--washi); padding: 1.4rem 1.2rem 1.2rem; }
+  .stat .num { font-family: var(--mincho); font-weight: 800; font-size: 2.5rem; line-height: 1.2; letter-spacing: .01em; font-variant-numeric: tabular-nums; }
+  .stat .num .u { font-size: .48em; margin-left: .1em; }
+  .stat .num.shu { color: var(--shu); }
+  .stat .cap { font-size: .8rem; color: var(--ink-soft); line-height: 1.7; margin-top: .3rem; }
+
+  /* ---- 仕分け図 ---- */
+  .triage { display: grid; gap: .8rem; margin: 2rem 0; }
+  .t-row { display: grid; grid-template-columns: 6.2rem 1fr; gap: 1rem; align-items: start; background: #fff; border: 1px solid var(--line); border-radius: 4px; padding: 1rem 1.2rem; }
+  .t-label { font-family: var(--mono); font-weight: 500; font-size: .85rem; padding: .15rem 0; text-align: center; border-radius: 3px; margin-top: .2rem; }
+  .t-lead { background: rgba(46,107,52,.1); color: var(--lead); }
+  .t-review { background: rgba(154,98,0,.1); color: var(--review); }
+  .t-spam { background: rgba(117,105,95,.14); color: var(--spam); }
+  .t-row p { margin: 0; font-size: .93rem; }
+
+  .oath {
+    background: var(--ink); color: var(--washi);
+    padding: 1.6rem 1.8rem; margin: 2.2rem 0; border-radius: 4px;
+    font-family: var(--mincho); font-size: 1.06rem; line-height: 2.1;
+  }
+  .oath b { color: #fff; border-bottom: 2px solid var(--shu-bright); font-weight: 700; }
+
+  /* ---- 表 ---- */
+  .tbl-wrap { overflow-x: auto; margin: 1.4rem 0; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; line-height: 1.8; background: #fff; }
+  th, td { text-align: left; padding: .65rem .9rem; border: 1px solid var(--line); vertical-align: top; }
+  th { font-size: .78rem; letter-spacing: .06em; color: var(--ink-soft); background: var(--washi-deep); white-space: nowrap; }
+  td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .note { font-size: .8rem; color: var(--ink-soft); line-height: 1.9; }
+
+  /* ---- はじめかた ---- */
+  .steps { counter-reset: step; display: grid; gap: 1.1rem; margin: 2rem 0; padding: 0; list-style: none; }
+  .steps li { counter-increment: step; position: relative; background: #fff; border: 1px solid var(--line); border-radius: 4px; padding: 1.3rem 1.4rem 1.3rem 4.4rem; }
+  .steps li::before {
+    content: counter(step);
+    position: absolute; left: 1.2rem; top: 1.15rem;
+    font-family: var(--mincho); font-weight: 800; font-size: 1.7rem; color: var(--shu);
+  }
+  .steps b { display: block; font-size: 1.02rem; margin-bottom: .2rem; }
+  .steps p { margin: 0; font-size: .92rem; color: var(--ink-soft); }
+
+  .oneliner { position: relative; background: var(--ink); border-radius: 4px; padding: 1.3rem 1.4rem; margin: 1.4rem 0; }
+  .oneliner code { display: block; font-family: var(--mono); font-size: .86rem; line-height: 1.9; color: #f2ece2; white-space: pre-wrap; word-break: break-all; padding-right: 5rem; }
+  .copy-btn {
+    position: absolute; top: .9rem; right: .9rem;
+    font-family: var(--gothic); font-weight: 700; font-size: .78rem;
+    background: var(--shu); color: #fff; border: 0; border-radius: 3px;
+    padding: .45rem .9rem; cursor: pointer;
+  }
+  .copy-btn:hover { background: var(--shu-bright); }
+
+  /* ---- FAQ ---- */
+  .faq details { background: #fff; border: 1px solid var(--line); border-radius: 4px; margin-bottom: .7rem; }
+  .faq summary {
+    cursor: pointer; font-weight: 700; padding: 1rem 1.3rem; list-style: none;
+    display: grid; grid-template-columns: 1.4rem 1fr; gap: .6rem; align-items: baseline;
+  }
+  .faq summary::-webkit-details-marker { display: none; }
+  .faq summary::before { content: "問"; font-family: var(--mincho); color: var(--shu); font-weight: 800; }
+  .faq details[open] summary { border-bottom: 1px dashed var(--line); }
+  .faq .a { padding: 1rem 1.3rem 1.2rem 3.3rem; font-size: .93rem; }
+  .faq .a p { margin: 0 0 .6rem; }
+  .faq .a p:last-child { margin: 0; }
+
+  /* ---- CTA帯・フッター ---- */
+  .cta-band {
+    background: var(--shu); color: #fff; border-radius: 4px;
+    padding: 2rem 2rem 2.2rem; margin: 3.5rem 0 0; text-align: left;
+  }
+  .cta-band h2 { color: #fff; font-size: 1.5rem; margin-bottom: .6rem; }
+  .cta-band p { font-size: .95rem; margin-bottom: 1.2rem; }
+  .cta-band .btn { background: #fff; color: var(--shu); box-shadow: 3px 3px 0 rgba(0,0,0,.3); }
+  .cta-band .btn:hover { transform: translate(-1px,-1px); box-shadow: 4px 4px 0 rgba(0,0,0,.3); }
+
+  footer { margin-top: 4rem; background: var(--ink); color: #cfc7bb; font-size: .85rem; line-height: 2; }
+  footer .wrap { padding: 2.6rem 1.4rem 3rem; }
+  .footer-logo { display: inline-block; background: var(--washi); border-radius: 4px; padding: 1.1rem 1.6rem; margin-bottom: 1.3rem; }
+  .footer-logo img { display: block; height: 30px; width: auto; }
+  footer a { color: #f2ece2; }
+  footer .eeat { border-top: 1px solid rgba(247,243,236,.18); margin-top: 1.4rem; padding-top: 1.4rem; font-size: .8rem; }
+
+  /* ---- 出現アニメーション ---- */
+  .reveal { opacity: 0; transform: translateY(14px); transition: opacity .7s ease, transform .7s ease; }
+  .reveal.in { opacity: 1; transform: none; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .reveal { opacity: 1; transform: none; transition: none; }
+    .btn, .copy-btn { transition: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="wrap">
+    <a class="brand" href="https://cloudnative.co.jp/" aria-label="株式会社クラウドネイティブ">
+      <img src="/assets/logo_cloudnative.svg" alt="CLOUD NATIVE" width="129" height="28">
+    </a>
+  </div>
+</div>
+
+<header class="hero">
+  <div class="wrap" style="position:relative">
+    <div class="hero-tate">株式会社クラウドネイティブ　公開レシピ</div>
+    <div class="hanko" aria-hidden="true">撲滅</div>
+    <h1>
+      <span class="small">お問い合わせフォームに届く迷惑な営業へ</span>
+      フォーム営業、<br><span class="bokumetsu">撲滅。</span>
+    </h1>
+    <p class="define"><strong>撲滅されるのは、営業文面を読むあなたの時間です。</strong><br>
+    メッセージそのものは削除されず隔離ボックスに残るので、万一の誤判定でも問い合わせが失われることはありません。</p>
+    <p style="max-width:36rem">あなたのフォームに届いた問い合わせを AI が自動で仕分けし、本物の問い合わせだけを届けます。この仕組みを自分の環境に構築できる<strong>無料公開の「作り方」</strong>を、実運用データごと公開しました。</p>
+    <div class="cta-row">
+      <a class="btn btn-shu" href="#start">自分で作る（無料レシピ）</a>
+      <a class="btn btn-ink" href="https://cloudnative.co.jp/contact/">作ってほしい方はこちら</a>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section id="reality">
+    <div class="wrap">
+      <div class="rail">一　実態</div>
+      <h2>問い合わせの約7割は、<br>営業でした。</h2>
+      <p>当社サイトのお問い合わせフォームを AI で仕分けて約6ヶ月。届いた問い合わせ550件のうち377件 —— 実に <em>約7割</em> が、SES 協業・人材紹介・M&amp;A・展示会勧誘といった営業文面でした。</p>
+      <div class="stats">
+        <div class="stat reveal"><div class="num shu">7<span class="u">割</span></div><div class="cap">全問い合わせに占める営業文面の比率（当社実測・377/550件）</div></div>
+        <div class="stat reveal"><div class="num">494<span class="u">件</span></div><div class="cap">約6ヶ月間に AI が自動分類した問い合わせ数</div></div>
+        <div class="stat reveal"><div class="num shu">0<span class="u">件</span></div><div class="cap">営業と誤判定されて埋もれた本物の問い合わせ（検知数）</div></div>
+      </div>
+      <p>フォーム営業は送信側が産業化しています。送信代行サービスが乱立し、いまや AI エージェントがリスト作成から送信までを自動化する時代です。<strong>CAPTCHA やボット対策では防げません</strong> —— 送ってくるのは（あるいは装っているのは）人間だからです。読んで、判断して、捨てる。その時間だけが毎日奪われていきます。</p>
+    </div>
+  </section>
+
+  <section id="how">
+    <div class="wrap">
+      <div class="rail">二　仕組み</div>
+      <h2>ブロックしない。<br>「仕分ける」から安全。</h2>
+      <p>届いた内容を AI が読み、3つに仕分けます。</p>
+      <div class="triage">
+        <div class="t-row reveal"><span class="t-label t-lead">LEAD</span><p><strong>本物の問い合わせ。</strong>すぐにあなたへ通知されます。</p></div>
+        <div class="t-row reveal"><span class="t-label t-review">REVIEW</span><p><strong>AI が判断を保留したもの。</strong>「要確認」としてあなたに届き、最終判断は人間がします。</p></div>
+        <div class="t-row reveal"><span class="t-label t-spam">SPAM</span><p><strong>営業文面。</strong>通知されず隔離ボックスへ。削除はされず、いつでも一覧・救出できます。</p></div>
+      </div>
+      <div class="oath reveal">
+        この仕組みの憲法 —— <b>迷ったら人間へ。壊れても人間へ。</b><br>
+        AI が故障しても全件が「要確認」に切り替わるだけで、フォームは止まらず、問い合わせは失われません。設計上、自動削除という機能が存在しません。
+      </div>
+      <p>さらに、あなたが判定を修正するたびに AI はそれを記憶し、<strong>あなたの会社専用の判定基準が使うほど賢くなります</strong>。判定基準はテンプレートの丸写しではなく、あなたに実際に届いた営業メッセージから作るので、他社の基準を研究しても回避できません。</p>
+    </div>
+  </section>
+
+  <section id="results">
+    <div class="wrap">
+      <div class="rail">三　実績</div>
+      <h2>6ヶ月運用して、<br>取りこぼしはゼロ。</h2>
+      <p>運用約6ヶ月・AI分類494件のうち人手修正9件（1.8%）。<strong>SPAM 判定に埋もれたリードの救出は0件</strong> —— 営業文面377件が人の目に触れずに隔離され、本物の問い合わせの取りこぼしは検知されていません。</p>
+      <div class="tbl-wrap reveal">
+        <table>
+          <tr><th>人手修正 9件の内訳</th><th>件数</th><th>意味</th></tr>
+          <tr><td>REVIEW を人間が確定</td><td class="num">4件</td><td>AI が保留し人間が判断 —— 設計どおりの動き</td></tr>
+          <tr><td>営業文面が LEAD 通知に混入</td><td class="num">2件</td><td>純粋な誤分類。ただし「読む手間が増えた」だけで実害なし</td></tr>
+          <tr><td>同一ラベルの確認操作</td><td class="num">3件</td><td>承認ボタンとして押されたもので誤分類ではない</td></tr>
+        </table>
+      </div>
+      <h3>障害まで含めて、公開します</h3>
+      <p>運用中に一度、利用していた AI モデルの提供終了で分類が全停止する障害を経験しました。このときも問い合わせは1件も失われていません —— 全件が自動的に「要確認」へ切り替わったからです。ただし気づけたのは検知アラームがあったからでした。<strong>この失敗から得た設計（静かに壊れる障害の検知方法）まで含めて、レシピに書いてあります。</strong></p>
+      <p class="note">※ 実績はいずれも当社環境・当社の判定基準での数値です。精度は判定基準の質に依存します。</p>
+    </div>
+  </section>
+
+  <section id="cost">
+    <div class="wrap">
+      <div class="rail">四　費用</div>
+      <h2>月100件のフォームなら、<br>月数百円。</h2>
+      <div class="tbl-wrap reveal">
+        <table>
+          <tr><th>項目</th><th>月100件の場合</th><th>月1,000件の場合</th></tr>
+          <tr><td>AI 費用（標準モデル）</td><td class="num">約 $2.6（数百円）</td><td class="num">約 $26</td></tr>
+          <tr><td>AI 費用（軽量モデル）</td><td class="num">約 $0.9（百数十円）</td><td class="num">約 $9</td></tr>
+          <tr><td>サーバー費用（Cloudflare）</td><td class="num">$0〜5</td><td class="num">$0〜5</td></tr>
+        </table>
+      </div>
+      <p>費用のほぼ全てが AI の利用料で、サーバー代は誤差です。<strong>使いすぎ防止の上限設定</strong>もセットアップ手順に含まれているので、想定外の請求が起きにくい構成です。</p>
+      <p class="note">※ 2026年8月時点の公式料金による概算。為替と料金改定で変動します。計算式と最新の確認方法はレシピ内の費用ドキュメントに記載。</p>
+    </div>
+  </section>
+
+  <section id="start">
+    <div class="wrap">
+      <div class="rail">五　はじめかた</div>
+      <h2>やることは、<br>1行貼って、答えるだけ。</h2>
+      <p>このレシピは完成品のソフトではなく、AI コーディングエージェント <strong>Claude Code</strong> が読んで実行する「作り方」です。あなたのフォーム・通知先・予算を質問されるので、答えていくと自分の環境に合わせた仕組みが組み上がります。プログラミングの知識は要りません。</p>
+      <ol class="steps">
+        <li class="reveal"><b>Claude Code を用意する</b><p>初めての方は当社公開の <a href="https://github.com/cloudnative-co/claude-code-starter-kit">claude-code-starter-kit</a>（対話型ウィザード）で環境を作れます。</p></li>
+        <li class="reveal"><b>次の1行をコピーして、Claude Code に貼る</b><p>下のボタンでコピーできます。</p></li>
+        <li class="reveal"><b>質問に答える</b><p>「今のフォームは何で動いてる？」「通知はどこに欲しい？」「月に何件くらい？」—— 答えるだけで、費用の見積りから設置、テストまで一緒に進みます。</p></li>
+      </ol>
+      <div class="oneliner reveal">
+        <button class="copy-btn" id="copy" type="button" aria-label="セットアップ用の1行をコピー">コピー</button>
+        <code id="oneliner-text">https://github.com/cloudnative-co/form-sales-guard の SKILL.md を読んで、フォーム営業対策のセットアップを始めて</code>
+      </div>
+      <p class="note">既存のフォームを一切変えたくない場合も大丈夫です。通知メールを転送するだけで導入できる方式（メール転送方式）もレシピに含まれています。中身をエンジニアが確認したい場合は <a href="https://github.com/cloudnative-co/form-sales-guard">GitHub リポジトリ</a>（MIT ライセンス）をどうぞ。</p>
+    </div>
+  </section>
+
+  <section id="faq">
+    <div class="wrap">
+      <div class="rail">六　よくある質問</div>
+      <h2>よくある質問</h2>
+      <div class="faq">
+        <details class="reveal"><summary>本物の問い合わせが営業と誤判定されたら？</summary><div class="a">
+          <p>削除ではなく隔離なので、隔離ボックスからワンクリックで救出できます。救出すると AI がそれを学習し、同じ間違いをしにくくなります。当社の6ヶ月の運用では、救出が必要になったケースは検知されていません（0件）。</p>
+        </div></details>
+        <details class="reveal"><summary>営業メッセージは自動で削除されるの？</summary><div class="a">
+          <p>いいえ。この仕組みには自動削除という機能が存在しません。営業と判定されたものも全て隔離ボックスに残り、いつでも一覧・確認できます。「撲滅」されるのはあなたがそれを読む時間だけです。</p>
+        </div></details>
+        <details class="reveal"><summary>判定を回避する営業が現れたら？</summary><div class="a">
+          <p>判定基準はあなたに実際に届いた営業から作られるため、公開されている情報を研究しても個社の判定は回避できません。仮にすり抜けても、あなたが修正ボタンを1回押せば AI が学習して追随します。</p>
+        </div></details>
+        <details class="reveal"><summary>セットアップで貼った営業メッセージはどこかに送られる？</summary><div class="a">
+          <p>あなた専用の判定基準を作るためだけに、あなたの手元（Claude Code）で使われます。このレシピの提供元に送られることはなく、レシピにも他人のメッセージは一切含まれていません。</p>
+        </div></details>
+        <details class="reveal"><summary>全部でいくらかかる？</summary><div class="a">
+          <p>月100件程度のフォームなら AI 費用が月数百円、サーバー代は無料枠でほぼゼロです。レシピ自体は無料（MIT ライセンス）。使いすぎ防止の上限設定も手順に含まれます。</p>
+        </div></details>
+        <details class="reveal"><summary>困ったときのサポートは？</summary><div class="a">
+          <p>これは無料公開のレシピであり、サポート付き製品ではありません。構築や運用を任せたい場合は、下記から株式会社クラウドネイティブにご相談ください（有償で対応します）。</p>
+        </div></details>
+      </div>
+
+      <div class="cta-band reveal">
+        <h2>自分でやりたくない方へ</h2>
+        <p>この仕組みの構築も、その先のセキュリティの相談も、私たちが直接お手伝いできます。フォーム営業にお困りの方はお気軽にどうぞ。</p>
+        <a class="btn" href="https://cloudnative.co.jp/contact/">クラウドネイティブに相談する</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="footer-logo">
+      <a href="https://cloudnative.co.jp/" aria-label="株式会社クラウドネイティブ">
+        <img src="/assets/logo_cloudnative.svg" alt="CLOUD NATIVE" width="152" height="33">
+      </a>
+    </div>
+    <p><strong style="color:#fff;font-family:var(--mincho)">フォーム営業撲滅AI</strong> —— 株式会社クラウドネイティブが自社で運用する仕組みの公開レシピ。<br>
+    <a href="https://github.com/cloudnative-co/form-sales-guard">GitHub（MIT ライセンス）</a> ／ <a href="https://cloudnative.co.jp/">株式会社クラウドネイティブ</a> ／ <a href="https://cloudnative.co.jp/contact/">お問い合わせ</a></p>
+    <p class="note" style="color:#a89c8d">本レシピはサポート付き製品ではありません。掲載の実績値は当社環境・当社基準での測定値であり、導入環境での結果を保証するものではありません。</p>
+    <div class="eeat">監修: 株式会社クラウドネイティブ 代表取締役社長 齊藤愼仁（文部科学省 最高情報セキュリティアドバイザー、著書『ITセキュリティ・ゼロトラスト概論』技術評論社）<br>© 2026 CloudNative Inc.</div>
+  </div>
+</footer>
+
+<script>
+  // コピー ボタン
+  document.getElementById('copy').addEventListener('click', async () => {
+    const btn = document.getElementById('copy');
+    try {
+      await navigator.clipboard.writeText(document.getElementById('oneliner-text').textContent.trim());
+      btn.textContent = 'コピーしました';
+    } catch {
+      btn.textContent = '選択してコピーしてください';
+    }
+    setTimeout(() => { btn.textContent = 'コピー'; }, 2200);
+  });
+  // スクロール出現（reduced-motion 時は CSS 側で無効）
+  const io = new IntersectionObserver((entries) => {
+    for (const e of entries) if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+  }, { threshold: 0.15 });
+  document.querySelectorAll('.reveal').forEach((el) => io.observe(el));
+</script>
+</body>
+</html>
