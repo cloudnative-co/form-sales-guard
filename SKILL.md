@@ -101,7 +101,7 @@ description: お問い合わせフォームに届く営業スパム（フォー�
    - 実行前に伝える: 「検収サンプルの本文は、判定のため Anthropic の API に送信されます（本番の分類と同一の経路です。他には送られません）」
    - プロジェクト内に `samples/` を作り、Step 2-3 で取り置いた**検収用**の実例を `lead_01.txt` / `spam_01.txt` の命名で保存（LEAD と SPAM は各1件以上必須。テンプレート同梱の `.gitignore` で除外されていることを確認）
    - `node <このリポジトリ>/tools/eval.mjs <プロジェクトのパス>` を実行（キーは `.dev.vars` から自動で読まれる）し、正解率・ラベル別内訳・**リード喪失方向の誤り（LEAD→SPAM）**を利用者に見せる
-   - 経路C を選んだ場合: 検収スクリプト（tools/eval.mjs）は `src/criteria.js`（JS）を読むため、`src/criteria.ts` の `CRITERIA` と同内容の `src/criteria.js` を一時生成して検収し、終わったら削除する（criteria.js も `.gitignore` 済み）
+   - 経路C を選んだ場合: 検収スクリプト（tools/eval.mjs）は `src/criteria.js`（JS）を読む。`src/criteria.ts` の `export const CRITERIA = {...}` を型注釈だけ外して `src/criteria.js` に一時生成すれば良い（eval.mjs は CRITERIA オブジェクト形式をそのまま受け付け、3フィールドの欠落・空は実行前に検出して停止する）。検収が終わったら削除する（criteria.js も `.gitignore` 済み。なお本番コードは `./criteria.ts` を拡張子付きで import するため、js を消し忘れてもビルドに紛れ込むことはない）
    - 外れた例があれば類型を基準に追記して再実行（このとき検収用の例を基準生成に転用したら、その例はもう検収に使えない）
    - **終わったら `samples/` を削除する**（`.dev.vars` は経路A/B のローカル開発でも使うため残してよい）
 4. デプロイ手順:

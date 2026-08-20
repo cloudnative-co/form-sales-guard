@@ -27,8 +27,11 @@ import {
 import type { FormInput, ProcessorMessage } from './classifier.js';
 // 判定基準は gitignore 済みの criteria.ts に分離する（機微な会社知識・営業類型を
 // tracked な processor.ts に書かせない — standalone copy での誤コミットを防ぐ）。
-// criteria.example.ts をコピーして criteria.ts を生成する（README の手順参照）
-import { CRITERIA } from './criteria.js';
+// criteria.example.ts をコピーして criteria.ts を生成する（README の手順参照）。
+// import は意図的に .ts 拡張子（tsconfig の allowImportingTsExtensions）: './criteria.js'
+// と書くと、検収用に一時生成した criteria.js が残留したとき esbuild がそちらを優先し、
+// criteria.ts の更新が黙ってバンドルから消える（tsc は .ts に解決するため検知できない）
+import { CRITERIA } from './criteria.ts';
 
 const log = {
   info: (msg: string, data?: object) => console.log(JSON.stringify({ level: 'info', msg, ...data })),
@@ -48,8 +51,11 @@ const FEW_SHOT_LIMIT = 10;
 // AWS SDK v3 の既定 requestTimeout は無制限。Anthropic クライアントを 60s に絞っても
 // （claude.ts）、DynamoDB / Secrets 呼び出しが無制限にハングすると Lambda 120s の
 // 外側タイムアウトで死に、検知ログにも乗らない。明示タイムアウトで内側を短くする。
+// throwOnRequestTimeout を付けないと requestTimeout 超過は警告ログのみでリクエストが
+// 継続する（= タイムアウトを設定したつもりで無制限）。TimeoutError はリトライ対象の
+// ため、実効上限は maxAttempts × requestTimeout + バックオフ（≈ 3 × 10s）。
 const AWS_CLIENT_CONFIG = {
-  requestHandler: { requestTimeout: 10_000, connectionTimeout: 3_000 },
+  requestHandler: { requestTimeout: 10_000, connectionTimeout: 3_000, throwOnRequestTimeout: true },
   maxAttempts: 3,
 };
 const ddbClient = new DynamoDBClient(AWS_CLIENT_CONFIG);

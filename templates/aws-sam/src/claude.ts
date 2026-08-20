@@ -90,10 +90,12 @@ const stripUntrustedTags = (s: string): string => {
   return out;
 };
 
-/** タグ外に置く短フィールド用: タグ偽装に加えて改行も除去（指示行の注入防止）。
- *  U+2028/U+2029/U+0085 も行区切りとして機能するため空白に正規化する */
+/** タグ外に置く短フィールド用: タグ偽装に加えて改行類も除去（指示行の注入防止）。
+ *  個別列挙は漏れる（\r\n の次は U+2028/2029、その次は VT/FF…と際限がない）ため、
+ *  Unicode プロパティで C0/C1 制御文字（\p{Cc}: \r \n \t VT FF FS GS RS NEL 等）と
+ *  行・段落分離子（\p{Zl}\p{Zp}: U+2028/U+2029）を一括で空白に正規化する */
 const inlineUntrusted = (s: string): string =>
-  stripUntrustedTags(s).replace(/[\r\n\u0085\u2028\u2029]+/g, ' ');
+  stripUntrustedTags(s).replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ');
 
 /** システムプロンプト = 固定の前文 + 注入された判定基準 + 固定の出力形式 */
 const buildSystemPrompt = (criteria: ClassificationCriteria): string => `あなたは企業の問い合わせフォームを分類するAIアシスタントです。

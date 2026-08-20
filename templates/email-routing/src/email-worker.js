@@ -29,12 +29,22 @@ const DEFAULT_MODEL = 'claude-sonnet-5'; // モデルIDは1箇所に集約（PIT
 const ANTHROPIC_VERSION = '2023-06-01';
 const CLASSIFY_TIMEOUT_MS = 45_000;
 const FEW_SHOT_TIMEOUT_MS = 3_000;
+// Slack Webhook の期限。notify の戻り値は最後の砦（全滅時 throw）の判定に使われるため、
+// ここがハング（エラーではなく無応答）するとハンドラごと止まり throw に到達しない
+const NOTIFY_TIMEOUT_MS = 10_000;
+// KV は同一キーへの書き込みを約1回/秒に制限する。保存直後の forwardFailed 再 put が
+// レート制限で落ちないよう、再 put は最小間隔を空ける
+const MIN_KEY_WRITE_INTERVAL_MS = 1_100;
 const MAX_REASONING_LENGTH = 500;
 // parse を試みるメールサイズの上限。Email Routing は最大25MiBを受け入れるが、
 // PostalMime.parse の CPU 消費でハンドラが強制終了すると catch にも素通し転送にも
-// 到達しない。フォーム通知メールは通常数十KB 以下なので、これを超える大容量メールは
-// 分類せず素通し転送する（fail-open: メールを落とさない）
-const MAX_PARSE_SIZE = 1_000_000;
+// 到達しない。CPU 上限は Free プランで 10ms しかなく、multipart のパート数が多い
+// メールや数百 KB の base64 添付 1 個でも超過しうる（サイズだけでは防げないため、
+// 閾値は「テキスト主体のフォーム通知メール」に絞れる大きさまで下げる）。
+// フォーム通知メールは通常数十 KB 以下。これを超えるメールは分類せず素通し転送する
+// （fail-open: メールを落とさない。添付付きメールまで分類したい場合は Paid プラン
+// （CPU 上限 既定30秒）にした上でこの値を引き上げる — README 参照）
+const MAX_PARSE_SIZE = 131_072;
 // 隔離時に保存する本文の上限。保存されるのはテキスト本文（無ければ HTML）の
 // 先頭1万文字のみで、添付ファイルと raw MIME は保存されない（KV 保存の制約）。
 // 救出画面・README の文言はこの制約と一致させること
@@ -111,6 +121,7 @@ export default {
       correctedAt: null,
     };
     let stored = true;
+    const storedAt = Date.now();
     try {
       // metadata は /quarantine が本文を get せず SPAM を絞り込むための索引
       await env.RECORDS.put(recordKey, JSON.stringify(record), {
@@ -144,6 +155,9 @@ export default {
         record.forwardFailed = true;
         if (stored) {
           try {
+            // 同一キーの保存直後なので、KV の書き込みレート制限（約1回/秒/キー）まで待つ
+            const sinceStore = Date.now() - storedAt;
+            if (sinceStore < MIN_KEY_WRITE_INTERVAL_MS) await sleep(MIN_KEY_WRITE_INTERVAL_MS - sinceStore);
             await env.RECORDS.put(recordKey, JSON.stringify(record), {
               metadata: { label: result.label, corrected: false },
             });
@@ -159,7 +173,10 @@ export default {
     const notified = await notify(env, record);
 
     // 非SPAM で「転送も保存も通知も」全て失敗した最悪ケースだけは、正常終了せず throw して
-    // Cloudflare にメールを委ねる（バウンス/リトライで送信者に失敗が伝わり、完全消失を防ぐ）
+    // Cloudflare にメールを委ねる（バウンス/リトライで送信者に失敗が伝わり、完全消失を防ぐ）。
+    // 注: ハンドラ失敗時に Email Routing が送信側 MTA に一時エラーを返し再送に倒れる挙動は
+    // 公式ドキュメントに明文が無い（実観測ベース）。だからこそ「正常終了で握りつぶす」より
+    // throw の方が安全側 — 最低でも黙って消えることはない
     if (!isSpam && record.forwardFailed && !stored && !notified) {
       throw new Error('All delivery paths failed (no forward, no storage, no notification)');
     }
@@ -339,13 +356,22 @@ async function notify(env, record) {
 差出人: ${escapeSlackText(record.from)} / 信頼度: ${record.aiConfidence}% / 理由: ${escapeSlackText(record.aiReasoning || '')}
 ${links}`;
 
-    const res = await fetch(webhook, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      // unfurl を明示的に無効化: 修正リンクのプレビュー取得を Slack にさせない
-      body: JSON.stringify({ text, unfurl_links: false, unfurl_media: false }),
-    });
-    if (!res.ok) throw new Error(`Webhook HTTP ${res.status}`);
+    // Webhook にも期限を置く（NOTIFY_TIMEOUT_MS のコメント参照: notify は全滅判定の
+    // 手前で await されるため、ハングするとハンドラごと止まり throw に到達しない）
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), NOTIFY_TIMEOUT_MS);
+    try {
+      const res = await fetch(webhook, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: { 'content-type': 'application/json' },
+        // unfurl を明示的に無効化: 修正リンクのプレビュー取得を Slack にさせない
+        body: JSON.stringify({ text, unfurl_links: false, unfurl_media: false }),
+      });
+      if (!res.ok) throw new Error(`Webhook HTTP ${res.status}`);
+    } finally {
+      clearTimeout(timer);
+    }
     return true;
   } catch (error) {
     console.error(`Notification failed: ${message2(error)}`);
@@ -459,39 +485,72 @@ async function handleQuarantine(url, env) {
   const expected = await hmacHex(env.CORRECTION_SECRET, 'quarantine');
   if (!timingSafeEqualHex(sig, expected)) return html('リンクの署名が正しくありません。', 403);
 
-  // 本文（record 全体）を全件 get すると、KV の 1 invocation あたりの操作数上限
-  // （約1000）に達し、隔離ボックス自体が返せなくなる。put 時に付与した metadata
-  // {label, corrected} を list（返却キー数に関わらず 1 操作）で読み、SPAM 未修正だけに
-  // 絞ってから本文を get する。get は表示する分（最大50）にほぼ限定される。
+  // ⚠️ このループは過去に2度壊れている（回帰注意）:
+  //   (1) 表示上限に達した時点で同一 list ページの残りキーを捨てて cursor を次ページに
+  //       進めると、その間の SPAM は「さらに古い記録を見る」でも二度と取得されない
+  //   (2) 本文（record 全体）を無制限に get すると、KV の 1 invocation あたりの操作数
+  //       上限（約1000）に達し、隔離ボックス自体が返せなくなる
+  // 現方式: put 時に付与した metadata {label, corrected} を list（返却キー数に関わらず
+  // 1 操作）で読んで SPAM 未修正だけに絞り、本文 get は表示分（最大50）と metadata の
+  // 無い旧データに限る。操作数には予算（OPS_BUDGET）を設け、途中で打ち切る場合は
+  // 「打ち切ったページの取得に使った cursor + 最後に処理したキー名(after)」を再開位置
+  // として返し、次の閲覧では同じページを再 list して処理済みキーを読み飛ばす
+  // （＝キーを捨てない。(1)(2) の両方を同時に満たす）。
+  const OPS_BUDGET = 900; // list/get の合計。上限約1000への安全マージン
+  const MAX_PAGES = 40; // 暴走防止（通常は OPS_BUDGET が先に効く）
   const rows = [];
-  let cursor = url.searchParams.get('cursor') || undefined;
-  let listComplete = false;
+  let pageCursor = url.searchParams.get('cursor') || undefined; // 現在ページの取得に使う cursor
+  let after = url.searchParams.get('after') || ''; // このキーまで処理済み（同一ページ内の再開位置）
+  let ops = 0;
   let pages = 0;
-  const MAX_PAGES = 40;
-  while (!listComplete && rows.length < 50 && pages < MAX_PAGES) {
-    pages++;
-    const list = await env.RECORDS.list({ prefix: 'record:', limit: 1000, cursor });
-    for (const key of list.keys) {
-      if (rows.length >= 50) break;
-      const m = key.metadata;
-      // metadata があれば SPAM 以外・修正済み・未分類(label:null)を get せず除外
-      if (m && (m.label !== 'SPAM' || m.corrected)) continue;
-      const raw = await env.RECORDS.get(key.name);
-      if (!raw) continue;
-      const r = JSON.parse(raw);
-      if (r.aiLabel !== 'SPAM' || r.humanLabel) continue;
-      const rescueSig = await hmacHex(env.CORRECTION_SECRET, `${r.key}:LEAD`);
-      rows.push(
-        `<tr><td>${escapeHtml(r.createdAt.slice(0, 10))}</td><td>${escapeHtml(r.from || '')}</td><td>${escapeHtml(r.subject || '')}</td><td>${escapeHtml((r.text || '').slice(0, 100))}</td><td><a href="/correct?key=${encodeURIComponent(r.key)}&label=LEAD&sig=${rescueSig}">本物だった（救出・本文表示）</a></td></tr>`,
-      );
+  let done = false; // 最後まで走査し終えた（moreLink 不要）
+
+  try {
+    outer: while (pages < MAX_PAGES && ops < OPS_BUDGET) {
+      pages++;
+      ops++;
+      const list = await env.RECORDS.list({ prefix: 'record:', limit: 1000, cursor: pageCursor });
+      for (const key of list.keys) {
+        if (after && key.name <= after) continue; // 再開時: 処理済みの位置まで読み飛ばす
+        const m = key.metadata;
+        // metadata があれば SPAM 以外・修正済み・未分類(label:null)を get せず除外。
+        // metadata が無い旧データのみ get して中身で判定する（新規デプロイは全件付与済み）
+        if (m && (m.label !== 'SPAM' || m.corrected)) {
+          after = key.name;
+          continue;
+        }
+        // 表示上限・操作予算に達したら現在位置で打ち切る（このページの残りは after で再開）
+        if (rows.length >= 50 || ops >= OPS_BUDGET) break outer;
+        ops++;
+        const raw = await env.RECORDS.get(key.name);
+        after = key.name;
+        if (!raw) continue;
+        const r = JSON.parse(raw);
+        if (r.aiLabel !== 'SPAM' || r.humanLabel) continue;
+        const rescueSig = await hmacHex(env.CORRECTION_SECRET, `${r.key}:LEAD`);
+        rows.push(
+          `<tr><td>${escapeHtml(r.createdAt.slice(0, 10))}</td><td>${escapeHtml(r.from || '')}</td><td>${escapeHtml(r.subject || '')}</td><td>${escapeHtml((r.text || '').slice(0, 100))}</td><td><a href="/correct?key=${encodeURIComponent(r.key)}&label=LEAD&sig=${rescueSig}">本物だった（救出・本文表示）</a></td></tr>`,
+        );
+      }
+      if (list.list_complete) {
+        done = true;
+        break;
+      }
+      pageCursor = list.cursor;
+      after = '';
     }
-    listComplete = list.list_complete;
-    cursor = list.cursor;
+  } catch (error) {
+    // 例外時も部分結果と再開リンクを返す（隔離ボックス全体を道連れにしない）
+    console.error(`Quarantine listing failed: ${message2(error)}`);
   }
 
-  const moreLink = !listComplete && cursor
-    ? `<p><a href="/quarantine?sig=${encodeURIComponent(sig)}&cursor=${encodeURIComponent(cursor)}">さらに古い記録を見る →</a></p>`
-    : '';
+  const resumeParams = [
+    pageCursor ? `&cursor=${encodeURIComponent(pageCursor)}` : '',
+    after ? `&after=${encodeURIComponent(after)}` : '',
+  ].join('');
+  const moreLink = done
+    ? ''
+    : `<p><a href="/quarantine?sig=${encodeURIComponent(sig)}${resumeParams}">さらに古い記録を見る →</a></p>`;
 
   return html(`<h1>隔離ボックス（営業と判定されたメール）</h1>
 <p>未対応の SPAM ${rows.length} 件を表示。メールは削除されず、ここからいつでも本文（先頭1万字・添付は保存されません）の確認と救出ができます。月1回の確認をおすすめします。</p>
@@ -531,6 +590,10 @@ function timingSafeEqualHex(a, b) {
 
 function message2(error) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function html(body, status = 200) {

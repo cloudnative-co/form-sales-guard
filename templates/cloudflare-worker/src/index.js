@@ -19,12 +19,20 @@ import { COMPANY_NAME, COMPANY_BLOCK, LABEL_BLOCK } from './criteria.js';
 
 const DEFAULT_MODEL = 'claude-sonnet-5';
 const ANTHROPIC_VERSION = '2023-06-01';
-// Cloudflare は HTTP 応答後の waitUntil() を約30秒で打ち切る。few-shot 取得(3s) +
-// 分類(この値) + KV 更新 + 通知 が 30 秒に収まるよう、分類タイムアウトを 20 秒にする。
-// 45 秒だと AI が 30 秒超ハングしたとき、abort/catch/REVIEW 保存より先に waitUntil が
-// キャンセルされ、fail-open にも検知にも乗らない。
-const CLASSIFY_TIMEOUT_MS = 20_000;
+// Cloudflare は HTTP 応答後の waitUntil() を約30秒で打ち切る。処理全体が収まるよう
+// 各段に予算を割り当てる: few-shot(3s) + 分類(18s) + 書き込み間隔(≤1.1s) + KV 更新(3s)
+// + 通知(3s) ≒ 28秒 < 30秒。分類だけでなく KV 更新・通知にも個別の期限を置くのは、
+// 期限の無い段が 1 つでもあると、そこが遅い故障（エラーではなくハング）をしたとき
+// waitUntil ごとキャンセルされ、fail-open（catch → REVIEW / ⚠️通知）にも検知にも
+// 乗らない不可視の消失になるため。
+const CLASSIFY_TIMEOUT_MS = 18_000;
 const FEW_SHOT_TIMEOUT_MS = 3_000; // few-shot 取得で分類本体を止めない（PITFALLS A-7）
+const STORE_TIMEOUT_MS = 3_000; // 分類結果の KV 更新（ハングも storageFailed に合流させる）
+const NOTIFY_TIMEOUT_MS = 3_000; // Slack Webhook（通常は1秒未満で応答する）
+// KV は同一キーへの書き込みを約1回/秒に制限する。受付時 put の直後に分類が即失敗
+// （API キー欠落・即時エラー等）すると分類結果の再 put がレート制限で落ち、レコードが
+// 未分類のまま残るため、再 put は受付時 put から最小間隔を空ける
+const MIN_KEY_WRITE_INTERVAL_MS = 1_100;
 const MIN_SUBMIT_SECONDS = 3; // これ未満の送信はボットとみなし黙殺（PITFALLS E-1）
 const MAX_REASONING_LENGTH = 500;
 
@@ -139,11 +147,11 @@ async function handleSubmit(request, env, ctx) {
   }
 
   // 即応答し、分類・通知は応答後に実行（安全不変条件 3 / PITFALLS B-1）
-  ctx.waitUntil(processSubmission(env, record));
+  ctx.waitUntil(processSubmission(env, record, Date.now()));
   return json({ success: true, message: 'お問い合わせを受け付けました' }, 200, headers);
 }
 
-async function processSubmission(env, record) {
+async function processSubmission(env, record, acceptedAt) {
   const examples = await getFewShotExamples(env);
   const result = await classify(env, record, examples); // 決して throw しない（安全不変条件 1）
 
@@ -152,11 +160,23 @@ async function processSubmission(env, record) {
   record.aiReasoning = result.reasoning;
   record.classificationFailed = result.failed === true;
 
+  // 同一キーの受付時 put から最小間隔を空ける（MIN_KEY_WRITE_INTERVAL_MS のコメント参照）
+  const sinceAccept = Date.now() - acceptedAt;
+  if (sinceAccept < MIN_KEY_WRITE_INTERVAL_MS) {
+    await sleep(MIN_KEY_WRITE_INTERVAL_MS - sinceAccept);
+  }
+
   try {
-    // metadata の label/corrected は /quarantine の絞り込み索引（本文 get を減らす）
-    await env.RECORDS.put(record.key, JSON.stringify(record), {
-      metadata: { label: record.aiLabel, corrected: false },
-    });
+    // metadata の label/corrected は /quarantine の絞り込み索引（本文 get を減らす）。
+    // put のハングも失敗として扱う（期限後に put が遅れて成功する可能性はあるが、
+    // その場合も ⚠️ 通知が余分に付くだけで安全側に倒れる）
+    await withTimeout(
+      env.RECORDS.put(record.key, JSON.stringify(record), {
+        metadata: { label: record.aiLabel, corrected: false },
+      }),
+      STORE_TIMEOUT_MS,
+      'Record update timeout',
+    );
   } catch (error) {
     // 保存できていないレコードは隔離ボックスに現れない。SPAM 判定のまま通知も
     // 抑止すると問い合わせが完全に不可視になるため、保存失敗時は SPAM 扱いを
@@ -266,10 +286,12 @@ function stripUntrustedTags(s) {
   return out;
 }
 
-/** タグ外に置く短フィールド用: タグ偽装に加えて改行も除去（指示行の注入防止）。
- *  U+2028/U+2029/U+0085 も行区切りとして機能するため空白に正規化する */
+/** タグ外に置く短フィールド用: タグ偽装に加えて改行類も除去（指示行の注入防止）。
+ *  個別列挙は漏れる（\r\n の次は U+2028/2029、その次は VT/FF…と際限がない）ため、
+ *  Unicode プロパティで C0/C1 制御文字（\p{Cc}: \r \n \t VT FF FS GS RS NEL 等）と
+ *  行・段落分離子（\p{Zl}\p{Zp}: U+2028/U+2029）を一括で空白に正規化する */
 function inlineUntrusted(s) {
-  return stripUntrustedTags(s).replace(/[\r\n\u0085\u2028\u2029]+/g, ' ');
+  return stripUntrustedTags(s).replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ');
 }
 
 function buildSystemPrompt(examples) {
@@ -365,7 +387,7 @@ async function notify(env, record) {
     const emoji = { LEAD: ':tada:', REVIEW: ':thinking_face:', SPAM: ':wastebasket:' }[record.aiLabel] || ':question:';
     const warn = [
       record.classificationFailed ? '\n:warning: *AI分類が失敗したため人間による確認が必要です*' : '',
-      record.storageFailed ? '\n:warning: *記録の保存に失敗しました。隔離ボックスに表示されないため、この通知が唯一の記録です*' : '',
+      record.storageFailed ? '\n:warning: *分類結果の保存に失敗しました。隔離ボックスに反映されないため、この通知で内容を確認してください*' : '',
     ].join('');
     const links = await correctionLinks(env, record);
 
@@ -377,13 +399,22 @@ async function notify(env, record) {
 メール: ${escapeSlackText(record.email)}
 ${links}`;
 
-    const res = await fetch(webhook, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      // unfurl を明示的に無効化: 修正リンクのプレビュー取得を Slack にさせない
-      body: JSON.stringify({ text, unfurl_links: false, unfurl_media: false }),
-    });
-    if (!res.ok) throw new Error(`Webhook HTTP ${res.status}`);
+    // Webhook にも期限を置く（ハングすると waitUntil ごとキャンセルされ、
+    // "Notification failed" ログすら出ない不可視の消失になる）
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), NOTIFY_TIMEOUT_MS);
+    try {
+      const res = await fetch(webhook, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: { 'content-type': 'application/json' },
+        // unfurl を明示的に無効化: 修正リンクのプレビュー取得を Slack にさせない
+        body: JSON.stringify({ text, unfurl_links: false, unfurl_media: false }),
+      });
+      if (!res.ok) throw new Error(`Webhook HTTP ${res.status}`);
+    } finally {
+      clearTimeout(timer);
+    }
   } catch (error) {
     console.error(`Notification failed: ${message(error)}`);
   }
@@ -514,41 +545,73 @@ async function handleQuarantine(url, env) {
     return html('リンクの署名が正しくありません。', 403);
   }
 
-  // 本文（record 全体）を全件 get すると、KV の 1 invocation あたりの操作数上限
-  // （約1000）に達し、隔離ボックス自体が返せなくなる。put 時に付与した metadata
-  // {label, corrected} を list（返却キー数に関わらず 1 操作）で読み、SPAM 未修正だけに
-  // 絞ってから本文を get する。get は表示する分（最大50）にほぼ限定される。
+  // ⚠️ このループは過去に2度壊れている（回帰注意）:
+  //   (1) 表示上限に達した時点で同一 list ページの残りキーを捨てて cursor を次ページに
+  //       進めると、その間の SPAM は「さらに古い記録を見る」でも二度と取得されない
+  //   (2) 本文（record 全体）を無制限に get すると、KV の 1 invocation あたりの操作数
+  //       上限（約1000）に達し、隔離ボックス自体が返せなくなる
+  // 現方式: put 時に付与した metadata {label, corrected} を list（返却キー数に関わらず
+  // 1 操作）で読んで SPAM 未修正だけに絞り、本文 get は表示分（最大50）と metadata の
+  // 無い旧データに限る。操作数には予算（OPS_BUDGET）を設け、途中で打ち切る場合は
+  // 「打ち切ったページの取得に使った cursor + 最後に処理したキー名(after)」を再開位置
+  // として返し、次の閲覧では同じページを再 list して処理済みキーを読み飛ばす
+  // （＝キーを捨てない。(1)(2) の両方を同時に満たす）。
+  const OPS_BUDGET = 900; // list/get の合計。上限約1000への安全マージン
+  const MAX_PAGES = 40; // 暴走防止（通常は OPS_BUDGET が先に効く）
   const rows = [];
-  let cursor = url.searchParams.get('cursor') || undefined;
-  let listComplete = false;
+  let pageCursor = url.searchParams.get('cursor') || undefined; // 現在ページの取得に使う cursor
+  let after = url.searchParams.get('after') || ''; // このキーまで処理済み（同一ページ内の再開位置）
+  let ops = 0;
   let pages = 0;
-  const MAX_PAGES = 40;
-  while (!listComplete && rows.length < 50 && pages < MAX_PAGES) {
-    pages++;
-    const list = await env.RECORDS.list({ prefix: 'record:', limit: 1000, cursor });
-    for (const key of list.keys) {
-      if (rows.length >= 50) break;
-      const m = key.metadata;
-      // metadata があれば SPAM 以外・修正済み・未分類(label:null)を get せず除外。
-      // metadata が無い旧データのみ get して中身で判定する（新規デプロイは全件付与済み）
-      if (m && (m.label !== 'SPAM' || m.corrected)) continue;
-      const raw = await env.RECORDS.get(key.name);
-      if (!raw) continue;
-      const r = JSON.parse(raw);
-      if (r.aiLabel !== 'SPAM' || r.humanLabel) continue;
-      const rescueSig = await hmacHex(env.CORRECTION_SECRET, `${r.key}:LEAD`);
-      const rescueUrl = `/correct?key=${encodeURIComponent(r.key)}&label=LEAD&sig=${rescueSig}`;
-      rows.push(
-        `<tr><td>${escapeHtml(r.createdAt.slice(0, 10))}</td><td>${escapeHtml(r.company || '')}</td><td>${escapeHtml(r.name || '')}</td><td>${escapeHtml((r.message || '').slice(0, 100))}</td><td><a href="${rescueUrl}">本物の問い合わせだった（救出）</a></td></tr>`,
-      );
+  let done = false; // 最後まで走査し終えた（moreLink 不要）
+
+  try {
+    outer: while (pages < MAX_PAGES && ops < OPS_BUDGET) {
+      pages++;
+      ops++;
+      const list = await env.RECORDS.list({ prefix: 'record:', limit: 1000, cursor: pageCursor });
+      for (const key of list.keys) {
+        if (after && key.name <= after) continue; // 再開時: 処理済みの位置まで読み飛ばす
+        const m = key.metadata;
+        // metadata があれば SPAM 以外・修正済み・未分類(label:null)を get せず除外。
+        // metadata が無い旧データのみ get して中身で判定する（新規デプロイは全件付与済み）
+        if (m && (m.label !== 'SPAM' || m.corrected)) {
+          after = key.name;
+          continue;
+        }
+        // 表示上限・操作予算に達したら現在位置で打ち切る（このページの残りは after で再開）
+        if (rows.length >= 50 || ops >= OPS_BUDGET) break outer;
+        ops++;
+        const raw = await env.RECORDS.get(key.name);
+        after = key.name;
+        if (!raw) continue;
+        const r = JSON.parse(raw);
+        if (r.aiLabel !== 'SPAM' || r.humanLabel) continue;
+        const rescueSig = await hmacHex(env.CORRECTION_SECRET, `${r.key}:LEAD`);
+        const rescueUrl = `/correct?key=${encodeURIComponent(r.key)}&label=LEAD&sig=${rescueSig}`;
+        rows.push(
+          `<tr><td>${escapeHtml(r.createdAt.slice(0, 10))}</td><td>${escapeHtml(r.company || '')}</td><td>${escapeHtml(r.name || '')}</td><td>${escapeHtml((r.message || '').slice(0, 100))}</td><td><a href="${rescueUrl}">本物の問い合わせだった（救出）</a></td></tr>`,
+        );
+      }
+      if (list.list_complete) {
+        done = true;
+        break;
+      }
+      pageCursor = list.cursor;
+      after = '';
     }
-    listComplete = list.list_complete;
-    cursor = list.cursor;
+  } catch (error) {
+    // 例外時も部分結果と再開リンクを返す（隔離ボックス全体を道連れにしない）
+    console.error(`Quarantine listing failed: ${message(error)}`);
   }
 
-  const moreLink = !listComplete && cursor
-    ? `<p><a href="/quarantine?sig=${encodeURIComponent(sig)}&cursor=${encodeURIComponent(cursor)}">さらに古い記録を見る →</a></p>`
-    : '';
+  const resumeParams = [
+    pageCursor ? `&cursor=${encodeURIComponent(pageCursor)}` : '',
+    after ? `&after=${encodeURIComponent(after)}` : '',
+  ].join('');
+  const moreLink = done
+    ? ''
+    : `<p><a href="/quarantine?sig=${encodeURIComponent(sig)}${resumeParams}">さらに古い記録を見る →</a></p>`;
 
   return html(`<h1>隔離ボックス（営業と判定されたもの）</h1>
 <p>未対応の SPAM ${rows.length} 件を表示。メッセージは削除されず、ここからいつでも救出できます。月1回の確認をおすすめします。</p>
@@ -622,6 +685,18 @@ function timingSafeEqualHex(a, b) {
 
 function message(error) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Promise に期限を付ける。期限側が先に落ちても元の Promise は継続する（安全側） */
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(label)), ms)),
+  ]);
 }
 
 function json(body, status, headers = {}) {

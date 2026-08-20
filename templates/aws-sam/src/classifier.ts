@@ -62,9 +62,11 @@ export interface ProcessorMessage {
 
 // AWS SDK v3 の既定 requestTimeout は無制限。同期 Lambda（Timeout 25s < API GW 29s）で
 // SQS / DynamoDB がハングすると 25s で強制終了し、クライアントは 5xx で再送しうる。
-// 明示タイムアウトで内側を短くする。
+// 明示タイムアウトで内側を短くする。throwOnRequestTimeout を付けないと requestTimeout
+// 超過は警告ログのみでリクエストが継続する（= 無制限のまま）。TimeoutError はリトライ
+// 対象のため、実効上限は maxAttempts × requestTimeout + バックオフ（≈ 2 × 8s < 25s）。
 const AWS_CLIENT_CONFIG = {
-  requestHandler: { requestTimeout: 8_000, connectionTimeout: 3_000 },
+  requestHandler: { requestTimeout: 8_000, connectionTimeout: 3_000, throwOnRequestTimeout: true },
   maxAttempts: 2,
 };
 const sqsClient = new SQSClient(AWS_CLIENT_CONFIG);

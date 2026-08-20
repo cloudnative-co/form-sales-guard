@@ -80,7 +80,31 @@ if (!existsSync(samplesDir)) {
   process.exit(1);
 }
 
-const { COMPANY_NAME, COMPANY_BLOCK, LABEL_BLOCK } = await import(pathToFileURL(criteriaPath).href);
+// 判定基準は経路A/B の named export 形式（COMPANY_NAME/COMPANY_BLOCK/LABEL_BLOCK）と
+// 経路C の CRITERIA オブジェクト形式（{ companyName, companyBlock, labelBlock }）の
+// 両方を受け入れる。ESM の動的 import は存在しない export を例外にせず undefined に
+// するため、ここで3値を検証しないと『undefinedへの問い合わせ』という system prompt の
+// まま検収が実行され、基準を一切読んでいないのに「全件正解」で通る（検収ゲートの偽陽性）
+const criteriaModule = await import(pathToFileURL(criteriaPath).href);
+const criteria = criteriaModule.CRITERIA
+  ? {
+      COMPANY_NAME: criteriaModule.CRITERIA.companyName,
+      COMPANY_BLOCK: criteriaModule.CRITERIA.companyBlock,
+      LABEL_BLOCK: criteriaModule.CRITERIA.labelBlock,
+    }
+  : criteriaModule;
+const missingCriteria = ['COMPANY_NAME', 'COMPANY_BLOCK', 'LABEL_BLOCK'].filter(
+  (name) => typeof criteria[name] !== 'string' || !criteria[name].trim(),
+);
+if (missingCriteria.length > 0) {
+  console.error(`判定基準の読み込みに失敗しました: ${criteriaPath}
+次のフィールドが欠落しているか空です: ${missingCriteria.join(', ')}
+criteria.js は次のどちらかの形式で export してください:
+  1. 経路A/B の形式: export const COMPANY_NAME / COMPANY_BLOCK / LABEL_BLOCK
+  2. 経路C の形式:   export const CRITERIA = { companyName, companyBlock, labelBlock }`);
+  process.exit(1);
+}
+const { COMPANY_NAME, COMPANY_BLOCK, LABEL_BLOCK } = criteria;
 
 const files = readdirSync(samplesDir)
   .filter((f) => f.endsWith('.txt'))
