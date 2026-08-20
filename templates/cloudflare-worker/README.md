@@ -10,7 +10,7 @@
                     few-shot 取得（KV） → AI 分類 → KV 記録更新 → 通知
 LEAD / REVIEW → Slack Webhook に通知（修正リンク付き）
 SPAM         → 通知なし・KV に隔離（/quarantine で一覧・救出）
-修正リンク    → GET /correct（HMAC 署名付き）→ few-shot に還流
+修正リンク    → GET /correct（確認画面・副作用なし）→ POST /correct（実行・HMAC 署名付き）→ few-shot に還流
 ```
 
 | ファイル | 役割 |

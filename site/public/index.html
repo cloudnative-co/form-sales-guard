@@ -16,7 +16,7 @@
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="フォーム営業撲滅AI — AIが問い合わせを判定。営業スパムを遮断。">
 <meta name="twitter:card" content="summary_large_image">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='14' fill='%23b71c1c'/><text x='50' y='68' font-size='52' text-anchor='middle' fill='white' font-family='serif' font-weight='bold'>撲</text></svg>">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Crect%20width='100'%20height='100'%20rx='14'%20fill='%23b71c1c'/%3E%3Ctext%20x='50'%20y='68'%20font-size='52'%20text-anchor='middle'%20fill='white'%20font-family='serif'%20font-weight='bold'%3E%E6%92%B2%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Shippori+Mincho+B1:wght@600;700;800&family=Zen+Kaku+Gothic+New:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
@@ -30,8 +30,8 @@
     --shu-bright: #d32121;
     --line: #d9cfc0;
     --lead: #2e6b34;
-    --review: #9a6200;
-    --spam: #75695f;
+    --review: #855400; /* コントラスト比 4.5:1 以上（WCAG AA・通常文字）を満たす暗さ */
+    --spam: #5f554c;
     --mincho: "Shippori Mincho B1", "Hiragino Mincho ProN", serif;
     --gothic: "Zen Kaku Gothic New", "Hiragino Sans", sans-serif;
     --mono: "IBM Plex Mono", "Menlo", monospace;
@@ -206,17 +206,20 @@
   footer a { color: #f2ece2; }
   footer .eeat { border-top: 1px solid rgba(247,243,236,.18); margin-top: 1.4rem; padding-top: 1.4rem; font-size: .8rem; }
 
-  /* ---- 出現アニメーション ---- */
-  .reveal { opacity: 0; transform: translateY(14px); transition: opacity .7s ease, transform .7s ease; }
-  .reveal.in { opacity: 1; transform: none; }
+  /* ---- 出現アニメーション ----
+     JS が動いたときだけ初期非表示にする（html.js は body 直後のスクリプトが付与）。
+     JS 無効・CSP ブロック・初期化失敗時は全要素が最初から見える */
+  .js .reveal { opacity: 0; transform: translateY(14px); transition: opacity .7s ease, transform .7s ease; }
+  .js .reveal.in { opacity: 1; transform: none; }
   @media (prefers-reduced-motion: reduce) {
     html { scroll-behavior: auto; }
-    .reveal { opacity: 1; transform: none; transition: none; }
+    .js .reveal { opacity: 1; transform: none; transition: none; }
     .btn, .copy-btn { transition: none; }
   }
 </style>
 </head>
 <body>
+<script>document.documentElement.classList.add('js');</script>
 
 <div class="topbar">
   <div class="wrap">
@@ -273,14 +276,14 @@
         この仕組みの憲法 —— <b>迷ったら人間へ。壊れても人間へ。</b><br>
         AI が故障しても全件が「要確認」に切り替わるだけで、フォームは止まらず、問い合わせは失われません。設計上、自動削除という機能が存在しません。
       </div>
-      <p>さらに、あなたが判定を修正するたびに AI はそれを記憶し、<strong>あなたの会社専用の判定基準が使うほど賢くなります</strong>。判定基準はテンプレートの丸写しではなく、あなたに実際に届いたメール —— 営業も、本物の問い合わせも —— から作り、<strong>運用を始める前に「あなたのメールでの正解率」を実測してから</strong>スタートします。他社の基準を研究しても回避できません。</p>
+      <p>さらに、あなたが判定を修正するとその例が記録され、<strong>次回以降の判定のお手本として反映されます</strong>（同じ間違いをしにくくなります）。判定基準はテンプレートの丸写しではなく、あなたに実際に届いたメール —— 営業も、本物の問い合わせも —— から作り、<strong>運用を始める前に「あなたのメールでの正解率」を実測してから</strong>スタートします。判定基準は公開されないため、公開情報を研究する型の回避が通用しにくい構造です。</p>
     </div>
   </section>
 
   <section id="results">
     <div class="wrap">
       <div class="rail">三　実績</div>
-      <h2>6ヶ月運用して、<br>取りこぼしはゼロ。</h2>
+      <h2>6ヶ月運用して、<br>検知された取りこぼしはゼロ。</h2>
       <p>運用約6ヶ月・AI分類494件のうち人手修正9件（1.8%）。<strong>SPAM 判定に埋もれたリードの救出は0件</strong> —— 営業文面377件が人の目に触れずに隔離され、本物の問い合わせの取りこぼしは検知されていません。</p>
       <div class="tbl-wrap reveal">
         <table>
@@ -303,7 +306,7 @@
       <div class="tbl-wrap reveal">
         <table>
           <tr><th>項目</th><th>月100件の場合</th><th>月1,000件の場合</th></tr>
-          <tr><td>AI 費用（標準モデル）</td><td class="num">約 $2.6（数百円）</td><td class="num">約 $26</td></tr>
+          <tr><td>AI 費用（標準モデル）</td><td class="num">約 $1.8（数百円）</td><td class="num">約 $18</td></tr>
           <tr><td>AI 費用（軽量モデル）</td><td class="num">約 $0.9（百数十円）</td><td class="num">約 $9</td></tr>
           <tr><td>サーバー費用（Cloudflare）</td><td class="num">$0〜5</td><td class="num">$0〜5</td></tr>
         </table>
@@ -324,7 +327,7 @@
         <li class="reveal"><b>質問に答える</b><p>「今のフォームは何で動いてる？」「通知はどこに欲しい？」「月に何件くらい？」—— 答えるだけで、費用の見積りから設置、テストまで一緒に進みます。</p></li>
       </ol>
       <div class="oneliner reveal">
-        <button class="copy-btn" id="copy" type="button" aria-label="セットアップ用の1行をコピー">コピー</button>
+        <button class="copy-btn" id="copy" type="button" aria-label="セットアップ用の1行をコピー" aria-live="polite">コピー</button>
         <code id="oneliner-text">https://github.com/cloudnative-co/form-sales-guard の SKILL.md を読んで、フォーム営業対策のセットアップを始めて</code>
       </div>
       <p class="note">既存のフォームを一切変えたくない場合も大丈夫です。通知メールを転送するだけで導入できる方式（メール転送方式）もレシピに含まれています。中身をエンジニアが確認したい場合は <a href="https://github.com/cloudnative-co/form-sales-guard">GitHub リポジトリ</a>（MIT ライセンス）をどうぞ。</p>
@@ -343,10 +346,10 @@
           <p>いいえ。この仕組みには自動削除という機能が存在しません。営業と判定されたものも全て隔離ボックスに残り、いつでも一覧・確認できます。「撲滅」されるのはあなたがそれを読む時間だけです。</p>
         </div></details>
         <details class="reveal"><summary>判定を回避する営業が現れたら？</summary><div class="a">
-          <p>判定基準はあなたに実際に届いた営業から作られるため、公開されている情報を研究しても個社の判定は回避できません。仮にすり抜けても、あなたが修正ボタンを1回押せば AI が学習して追随します。</p>
+          <p>判定基準はあなたに実際に届いた営業から作られ、公開もされないため、公開情報を研究する型の回避は通用しにくい構造です（回避を不可能にする保証ではありません）。すり抜けた場合も、あなたが修正すればその例が判定のお手本に加わり、同種のすり抜けをしにくくなります。</p>
         </div></details>
         <details class="reveal"><summary>セットアップで貼ったメールはどこかに送られる？</summary><div class="a">
-          <p>使い道は3つだけです —— あなた専用の判定基準の生成、運用開始前の精度テスト（本番と同じ AI に判定させて正解率を測ります）、見分けにくい例のお手本登録。いずれもあなたの手元とあなた自身の環境で完結し、このレシピの提供元に送られることはありません。レシピにも他人のメッセージは一切含まれていません。</p>
+          <p>使い道は3つだけです —— あなた専用の判定基準の生成、運用開始前の精度テスト、見分けにくい例のお手本登録。判定基準の生成では貼った文面を Claude Code（Anthropic の AI）が読み、精度テストと運用開始後の分類では本文が Anthropic の API に送信されます（本番の仕分けと同じ経路です）。<strong>このレシピの提供元（当社）に送られることはありません</strong>し、レシピにも他人のメッセージは一切含まれていません。顧客名などの機微な部分は伏せ字にして貼っても構いません。Anthropic API のデータの扱いは<a href="https://privacy.anthropic.com/">同社の公式ドキュメント</a>をご確認ください。</p>
         </div></details>
         <details class="reveal"><summary>全部でいくらかかる？</summary><div class="a">
           <p>月100件程度のフォームなら AI 費用が月数百円、サーバー代は無料枠でほぼゼロです。レシピ自体は無料（MIT ライセンス）。使いすぎ防止の上限設定も手順に含まれます。</p>

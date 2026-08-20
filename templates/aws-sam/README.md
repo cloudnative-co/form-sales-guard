@@ -80,7 +80,7 @@ SPAM も削除されず (1) DynamoDB の全レコード、(2) SPAM 専用 Slack 
 | A-1 モデル引退のサイレント劣化 | `claude.ts` の `MODEL_ID` 1箇所集約 + `template.yaml` の分類失敗アラーム |
 | A-2/A-3 thinking ブロックと max_tokens | `claude.ts` の text ブロック探索・`max_tokens: 4096` |
 | A-4 LLM 出力の防御的パース | `claude.ts` の型ガード（label enum / confidence 丸め / reasoning フォールバック+500字） |
-| A-5 SDK タイムアウトの階層 | `claude.ts` の `timeout: 60_000`（< Lambda 120s） |
+| A-5 SDK タイムアウトの階層 | `claude.ts` の `timeout: 45_000, maxRetries: 1`（リトライ込み総所要 ≈ 92s < Lambda 120s） |
 | A-6/A-7 few-shot のタグと分離 | `claude.ts` の untrusted タグ / `processor.ts` の 3s タイムアウト+キャッシュ |
 | B-1 fire-and-forget 禁止 | SQS 分離 + `Promise.allSettled` 並列（`processor.ts`） |
 | B-2 同期 25s < API GW 29s | `template.yaml` の Globals コメント |

@@ -146,8 +146,12 @@ Resources:
       Policies:
         - SQSSendMessagePolicy:
             QueueName: !GetAtt ProcessingQueue.QueueName
-        - DynamoDBWritePolicy:
-            TableName: !Ref RecordsTable
+        # 最小権限: classifier が使う API は PutItem のみ（ポリシーテンプレートは
+        # Update/Delete/BatchWrite まで含むため使わない）
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt RecordsTable.Arn
       Events:
         SubmitApi:
           Type: Api
@@ -179,8 +183,9 @@ Resources:
     Properties:
       FunctionName: form-guard-processor
       Handler: processor.handler
-      # SQS 起動なので API GW の 29 秒制約を受けない。AI API のクライアント
-      # タイムアウト（60s、claude.ts 参照）より長く取る（タイムアウトの階層）。
+      # SQS 起動なので API GW の 29 秒制約を受けない。AI API クライアントの
+      # リトライ込み総所要（45s × 2 試行 + バックオフ ≈ 92s、claude.ts 参照）より
+      # 長く取る（タイムアウトの階層。1 試行の timeout ではなく総所要で比較する）。
       Timeout: 120
       CodeUri: ./
       Description: Classifies queued submissions with AI, updates record, notifies Slack
@@ -191,10 +196,18 @@ Resources:
           SLACK_CHANNEL_LEADS: !Ref SlackChannelLeads
           SLACK_CHANNEL_REVIEW: !Ref SlackChannelReview
           SLACK_CHANNEL_SPAM: !Ref SlackChannelSpam
+      # 最小権限: processor が使う API は UpdateItem（記録更新・Slack ts 保存）と
+      # CorrectedIndex への Query（few-shot 取得）のみ。CrudPolicy だと Scan /
+      # DeleteItem / BatchWrite までテーブル全体に付与され、Lambda や依存パッケージの
+      # 侵害時に問い合わせ PII の全件取得・削除まで可能になる
       Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref RecordsTable
         - Statement:
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt RecordsTable.Arn
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource: !Sub '${RecordsTable.Arn}/index/CorrectedIndex'
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource: !Ref SecretsArn
@@ -228,10 +241,16 @@ Resources:
         Variables:
           SECRETS_ARN: !Ref SecretsArn
           TABLE_NAME: !Ref RecordsTable
+      # 最小権限: feedback が使う API は SlackTsIndex への Query（IDOR 逆引き突合）と
+      # UpdateItem（humanLabel 記録）のみ
       Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref RecordsTable
         - Statement:
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt RecordsTable.Arn
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource: !Sub '${RecordsTable.Arn}/index/SlackTsIndex'
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource: !Ref SecretsArn
@@ -333,12 +352,13 @@ Resources:
         - !Ref AlarmTopic
 
   # 記録更新失敗の検知（失敗すると「分類ラベルなしのまま Slack 通知だけ完了」という
-  # データ不整合がサイレントに発生するため）
+  # データ不整合がサイレントに発生するため）。Slack ts の保存失敗（修正ボタンの
+  # 逆引きが壊れる）も同じ「記録の不整合」としてここで検知する（?A ?B は OR マッチ）
   RecordUpdateFailureMetricFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
       LogGroupName: !Ref ProcessorLogGroup
-      FilterPattern: '"Failed to update classification"'
+      FilterPattern: '?"Failed to update classification" ?"Failed to update Slack info"'
       MetricTransformations:
         - MetricName: RecordUpdateFailures
           MetricNamespace: FormGuard
@@ -378,6 +398,30 @@ Resources:
       Period: 60
       EvaluationPeriods: 1
       Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  # ソースキュー滞留の検知。イベントソースマッピング停止・processor の継続的な障害では
+  # 受信カウントが増えず DLQ アラームに乗らないまま、メッセージが保持期限（4日）切れで
+  # 消失する。最古メッセージの滞留時間で「処理が進んでいない」ことを直接検知する
+  QueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: form-guard-queue-age
+      AlarmDescription: Oldest message in processing queue is older than 30 minutes - processing may be stalled (event source disabled, throttled, or failing before DLQ)
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ProcessingQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1800
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
       AlarmActions:

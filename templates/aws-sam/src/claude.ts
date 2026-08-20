@@ -65,10 +65,31 @@ export const createClaudeClient = (apiKey: string): Anthropic => {
   // SDK 既定（タイムアウト 10 分・リトライ 2 回）は Lambda Timeout 120s を大幅に
   // 超える（PITFALLS A-5）。既定のままだと API ハング時に Lambda 側のタイムアウトで
   // 死に、"Classification failed" ログが出ず検知アラームにも乗らない。
-  // クライアント側で 60s < Lambda 120s と明示し、必ず自前の catch を通す
-  // （タイムアウトの階層: 内側は必ず外側より短く）。
-  return new Anthropic({ apiKey, timeout: 60_000, maxRetries: 1 });
+  // 注意: SDK はタイムアウト自体もリトライ対象のため、階層の比較は 1 試行ではなく
+  // 「timeout × (maxRetries + 1) + バックオフ」の総所要で行う。
+  // 45s × 2 試行 + バックオフ ≈ 92s < Lambda 120s（残りは記録更新・Slack 通知の余裕）。
+  // 60s のままだと 2 試行で 120s を超え、REVIEW フォールバックに到達できない。
+  return new Anthropic({ apiKey, timeout: 45_000, maxRetries: 1 });
 };
+
+/**
+ * untrusted タグ境界の偽装を除去する。本文に </untrusted_user_input> を埋め込むと
+ * 実際にタグが閉じ、以降の文面がタグ外（=指示側）に出てしまうため、タグ内に
+ * 埋め込む全フィールドからタグ文字列そのものを取り除く（除去で新たにタグが
+ * 合成されないよう、変化しなくなるまで繰り返す）
+ */
+const stripUntrustedTags = (s: string): string => {
+  let out = String(s ?? '');
+  let prev: string;
+  do {
+    prev = out;
+    out = out.replace(/<\/?\s*untrusted_user_input[^>]*>/gi, '');
+  } while (out !== prev);
+  return out;
+};
+
+/** タグ外に置く短フィールド用: タグ偽装に加えて改行も除去（指示行の注入防止） */
+const inlineUntrusted = (s: string): string => stripUntrustedTags(s).replace(/[\r\n]+/g, ' ');
 
 /** システムプロンプト = 固定の前文 + 注入された判定基準 + 固定の出力形式 */
 const buildSystemPrompt = (criteria: ClassificationCriteria): string => `あなたは企業の問い合わせフォームを分類するAIアシスタントです。
@@ -105,8 +126,8 @@ export const buildPromptWithExamples = (
       (ex, i) => `
 ### 例${i + 1}
 <untrusted_user_input>
-会社名: ${ex.input.company}
-本文: ${ex.input.message.slice(0, 200)}...
+会社名: ${stripUntrustedTags(ex.input.company)}
+本文: ${stripUntrustedTags(ex.input.message.slice(0, 200))}...
 </untrusted_user_input>
 → 正解: ${ex.label}`,
     )
@@ -125,14 +146,14 @@ export const classifyContact = async (
 
   const userMessage = `## 問い合わせ内容
 
-問い合わせ種別: ${input.inquiryType}
-ページ: ${input.page || '不明'}
+問い合わせ種別: ${inlineUntrusted(input.inquiryType) || '不明'}
+ページ: ${inlineUntrusted(input.page || '') || '不明'}
 
 <untrusted_user_input>
-会社名: ${input.company}
-名前: ${input.lastName} ${input.firstName}
+会社名: ${stripUntrustedTags(input.company)}
+名前: ${stripUntrustedTags(input.lastName)} ${stripUntrustedTags(input.firstName)}
 本文:
-${input.message}
+${stripUntrustedTags(input.message)}
 </untrusted_user_input>`;
 
   try {

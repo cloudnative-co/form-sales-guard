@@ -7,7 +7,7 @@
  *   3. 即応答 + 非同期 ...... /submit は即 200 を返し、分類・通知は ctx.waitUntil() で実行
  *   4. untrusted タグ ....... 入力と few-shot 例を <untrusted_user_input> で包む
  *   5. 失敗の検知 ........... 分類失敗は ⚠️ 付きで通知 + "Classification failed" ログ
- *   6. 人間の修正 UI ........ 署名付き修正リンク。AI の元判定は上書きしない
+ *   6. 人間の修正 UI ........ 署名付き修正リンク（GET=確認画面 / POST=実行）。AI の元判定は上書きしない
  *   7. 費用上限 ............. コードではなく運用設定（SKILL.md Step 4）で担保
  */
 
@@ -51,7 +51,11 @@ export default {
 
     if (request.method === 'OPTIONS') return corsPreflight(env);
     if (request.method === 'POST' && url.pathname === '/submit') return handleSubmit(request, env, ctx);
-    if (request.method === 'GET' && url.pathname === '/correct') return handleCorrect(url, env);
+    // 修正は GET（確認画面・副作用なし）→ POST（実行）の2段階。GET で状態を変えると
+    // Slack のリンク展開クローラーやメールのプリフェッチが「リンクを踏んだ」ことになり、
+    // 人間の操作なしに誤った修正が few-shot に記録される
+    if (request.method === 'GET' && url.pathname === '/correct') return handleCorrectConfirm(url, env);
+    if (request.method === 'POST' && url.pathname === '/correct') return handleCorrectSubmit(request, env);
     if (request.method === 'GET' && url.pathname === '/quarantine') return handleQuarantine(url, env);
     if (request.method === 'GET' && url.pathname === '/test-form' && env.TEST_FORM === 'true') {
       return new Response(TEST_FORM_HTML, { headers: { 'content-type': 'text/html; charset=utf-8' } });
@@ -112,6 +116,7 @@ async function handleSubmit(request, env, ctx) {
     aiConfidence: null,
     aiReasoning: null,
     classificationFailed: false,
+    storageFailed: false,
     humanLabel: null, // 修正されても aiLabel は上書きしない（PITFALLS D-5）
     correctedAt: null,
   };
@@ -140,7 +145,11 @@ async function processSubmission(env, record) {
   try {
     await env.RECORDS.put(record.key, JSON.stringify(record));
   } catch (error) {
+    // 保存できていないレコードは隔離ボックスに現れない。SPAM 判定のまま通知も
+    // 抑止すると問い合わせが完全に不可視になるため、保存失敗時は SPAM 扱いを
+    // やめて ⚠️ 付きで通常通知する（fail-open: 失敗は常に「人間行き」に倒す）
     console.error(`Record update failed: ${message(error)}`);
+    record.storageFailed = true;
   }
 
   await notify(env, record); // 通知失敗もここで握る（never-reject）
@@ -224,6 +233,27 @@ function parseClassification(text) {
 // プロンプト組み立て（prompts/classifier-skeleton.md の 4 ブロック構造）
 // ---------------------------------------------------------------------------
 
+/**
+ * untrusted タグ境界の偽装を除去する。本文に </untrusted_user_input> を埋め込むと
+ * 実際にタグが閉じ、以降の文面がタグ外（=指示側）に出てしまうため、タグ内に
+ * 埋め込む全フィールドからタグ文字列そのものを取り除く（除去で新たにタグが
+ * 合成されないよう、変化しなくなるまで繰り返す）
+ */
+function stripUntrustedTags(s) {
+  let out = String(s ?? '');
+  let prev;
+  do {
+    prev = out;
+    out = out.replace(/<\/?\s*untrusted_user_input[^>]*>/gi, '');
+  } while (out !== prev);
+  return out;
+}
+
+/** タグ外に置く短フィールド用: タグ偽装に加えて改行も除去（指示行の注入防止） */
+function inlineUntrusted(s) {
+  return stripUntrustedTags(s).replace(/[\r\n]+/g, ' ');
+}
+
 function buildSystemPrompt(examples) {
   const base = `あなたは企業の問い合わせフォームを分類するAIアシスタントです。
 ${COMPANY_NAME}への問い合わせを分類してください。
@@ -251,8 +281,8 @@ JSONのみを出力し、他の文章は含めないでください。`;
       (ex, i) => `
 ### 例${i + 1}
 <untrusted_user_input>
-会社名: ${ex.company}
-本文: ${ex.messageExcerpt}...
+会社名: ${stripUntrustedTags(ex.company)}
+本文: ${stripUntrustedTags(ex.messageExcerpt)}...
 </untrusted_user_input>
 → 正解: ${ex.correctLabel}`,
     )
@@ -264,14 +294,14 @@ JSONのみを出力し、他の文章は含めないでください。`;
 function buildUserMessage(record) {
   return `## 問い合わせ内容
 
-問い合わせ種別: ${record.inquiryType || '不明'}
-ページ: ${record.page || '不明'}
+問い合わせ種別: ${inlineUntrusted(record.inquiryType) || '不明'}
+ページ: ${inlineUntrusted(record.page) || '不明'}
 
 <untrusted_user_input>
-会社名: ${record.company}
-名前: ${record.name}
+会社名: ${stripUntrustedTags(record.company)}
+名前: ${stripUntrustedTags(record.name)}
 本文:
-${record.message}
+${stripUntrustedTags(record.message)}
 </untrusted_user_input>`;
 }
 
@@ -306,7 +336,8 @@ async function getFewShotExamples(env) {
 
 async function notify(env, record) {
   try {
-    const isSpam = record.aiLabel === 'SPAM' && !record.classificationFailed;
+    // 記録の保存に失敗した SPAM は隔離ボックスに現れないため、SPAM 扱いせず通常通知に流す
+    const isSpam = record.aiLabel === 'SPAM' && !record.classificationFailed && !record.storageFailed;
     const webhook = isSpam ? env.SLACK_WEBHOOK_SPAM : env.SLACK_WEBHOOK_URL;
     if (!webhook) {
       if (!isSpam) console.error('Notification failed: SLACK_WEBHOOK_URL is not set');
@@ -314,19 +345,25 @@ async function notify(env, record) {
     }
 
     const emoji = { LEAD: ':tada:', REVIEW: ':thinking_face:', SPAM: ':wastebasket:' }[record.aiLabel] || ':question:';
-    const warn = record.classificationFailed ? '\n:warning: *AI分類が失敗したため人間による確認が必要です*' : '';
+    const warn = [
+      record.classificationFailed ? '\n:warning: *AI分類が失敗したため人間による確認が必要です*' : '',
+      record.storageFailed ? '\n:warning: *記録の保存に失敗しました。隔離ボックスに表示されないため、この通知が唯一の記録です*' : '',
+    ].join('');
     const links = await correctionLinks(env, record);
 
-    const text = `${emoji} *[${record.aiLabel}]* ${record.company || '(会社名なし)'} — ${record.name}${warn}
-> ${record.message.slice(0, 300).replace(/\n/g, '\n> ')}
-種別: ${record.inquiryType || '不明'} / 信頼度: ${record.aiConfidence}% / 理由: ${record.aiReasoning}
-メール: ${record.email}
+    // ユーザー由来の値は Slack mrkdwn として解釈されないよう escape する
+    // （<!channel> による全体メンションや <URL|ラベル> 形式の偽リンク挿入の防止）
+    const text = `${emoji} *[${record.aiLabel}]* ${escapeSlackText(record.company || '(会社名なし)')} — ${escapeSlackText(record.name)}${warn}
+> ${escapeSlackText(record.message.slice(0, 300)).replace(/\n/g, '\n> ')}
+種別: ${escapeSlackText(record.inquiryType || '不明')} / 信頼度: ${record.aiConfidence}% / 理由: ${escapeSlackText(record.aiReasoning || '')}
+メール: ${escapeSlackText(record.email)}
 ${links}`;
 
     const res = await fetch(webhook, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text }),
+      // unfurl を明示的に無効化: 修正リンクのプレビュー取得を Slack にさせない
+      body: JSON.stringify({ text, unfurl_links: false, unfurl_media: false }),
     });
     if (!res.ok) throw new Error(`Webhook HTTP ${res.status}`);
   } catch (error) {
@@ -347,29 +384,72 @@ async function correctionLinks(env, record) {
 }
 
 // ---------------------------------------------------------------------------
-// GET /correct — 署名付き修正リンク（人間の最終判断 → few-shot に還流）
+// /correct — 署名付き修正リンク（人間の最終判断 → few-shot に還流）
+// GET は確認画面のみ（副作用なし: unfurl クローラー・プリフェッチ対策）、実行は POST
 // ---------------------------------------------------------------------------
 
-async function handleCorrect(url, env) {
-  const key = url.searchParams.get('key') || '';
-  const label = url.searchParams.get('label') || '';
-  const sig = url.searchParams.get('sig') || '';
-
+/** key/label/sig の検証（署名検証はレコード読み込みより先 — PITFALLS D-1 と同じ原則） */
+async function verifyCorrectionParams(env, key, label, sig) {
   if (!['LEAD', 'REVIEW', 'SPAM'].includes(label) || !key.startsWith('record:')) {
     return html('リンクが正しくありません。', 400);
   }
-  // 署名検証はレコード読み込みより先（PITFALLS D-1 と同じ原則）
   const expected = await hmacHex(env.CORRECTION_SECRET, `${key}:${label}`);
   if (!timingSafeEqualHex(sig, expected)) {
     return html('リンクの署名が正しくありません。', 403);
   }
+  return null;
+}
+
+async function handleCorrectConfirm(url, env) {
+  const key = url.searchParams.get('key') || '';
+  const label = url.searchParams.get('label') || '';
+  const sig = url.searchParams.get('sig') || '';
+
+  const invalid = await verifyCorrectionParams(env, key, label, sig);
+  if (invalid) return invalid;
 
   const raw = await env.RECORDS.get(key);
   if (!raw) return html('対象の記録が見つかりませんでした。', 404);
   const record = JSON.parse(raw);
 
   if (record.humanLabel) {
-    return html(`この問い合わせは既に「${record.humanLabel}」として修正済みです。`);
+    return html(`この問い合わせは既に「${escapeHtml(record.humanLabel)}」として修正済みです。`);
+  }
+
+  // 状態は一切変えない。実行は下のフォーム（POST）でのみ行う
+  return html(`<h1>分類の修正</h1>
+<p>この問い合わせの分類を「${escapeHtml(record.aiLabel || '未分類')}」から「<b>${escapeHtml(label)}</b>」に修正します。よろしければボタンを押してください。</p>
+<p style="background:#f5f5f5;padding:1rem;border-radius:4px"><b>会社名:</b> ${escapeHtml(record.company || '(なし)')}<br>
+<b>名前:</b> ${escapeHtml(record.name || '')}<br>
+<b>本文（先頭200字）:</b> ${escapeHtml((record.message || '').slice(0, 200))}</p>
+<form method="POST" action="/correct">
+<input type="hidden" name="key" value="${escapeHtml(key)}">
+<input type="hidden" name="label" value="${escapeHtml(label)}">
+<input type="hidden" name="sig" value="${escapeHtml(sig)}">
+<button type="submit" style="padding:.7rem 2.2rem;font-size:1rem;cursor:pointer">「${escapeHtml(label)}」に修正を実行する</button>
+</form>`);
+}
+
+async function handleCorrectSubmit(request, env) {
+  let form;
+  try {
+    form = await request.formData();
+  } catch {
+    return html('リクエストが正しくありません。', 400);
+  }
+  const key = String(form.get('key') || '');
+  const label = String(form.get('label') || '');
+  const sig = String(form.get('sig') || '');
+
+  const invalid = await verifyCorrectionParams(env, key, label, sig);
+  if (invalid) return invalid;
+
+  const raw = await env.RECORDS.get(key);
+  if (!raw) return html('対象の記録が見つかりませんでした。', 404);
+  const record = JSON.parse(raw);
+
+  if (record.humanLabel) {
+    return html(`この問い合わせは既に「${escapeHtml(record.humanLabel)}」として修正済みです。`);
   }
 
   // AI の元判定（aiLabel）は上書きしない（PITFALLS D-5）
@@ -388,7 +468,7 @@ async function handleCorrect(url, env) {
     }),
   );
 
-  return html(`修正を記録しました（${record.aiLabel} → ${label}）。今後の自動判定に反映されます。`);
+  return html(`修正を記録しました（${escapeHtml(record.aiLabel || '未分類')} → ${escapeHtml(label)}）。今後の自動判定に反映されます。`);
 }
 
 // ---------------------------------------------------------------------------
@@ -402,27 +482,47 @@ async function handleQuarantine(url, env) {
     return html('リンクの署名が正しくありません。', 403);
   }
 
-  const list = await env.RECORDS.list({ prefix: 'record:', limit: 100 });
+  // list() は 1 回で全件を返さない（cursor 付きページング）。先頭ページだけ見ると
+  // 新着 LEAD/REVIEW に押し出された古い SPAM が永久に見えなくなるため、
+  // 50 件集まるか走査上限に達するまでページを進め、続きへのリンクも出す
   const rows = [];
-  for (const key of list.keys) {
-    if (rows.length >= 50) break;
-    const raw = await env.RECORDS.get(key.name);
-    if (!raw) continue;
-    const r = JSON.parse(raw);
-    if (r.aiLabel !== 'SPAM' || r.humanLabel) continue;
-    const rescueSig = await hmacHex(env.CORRECTION_SECRET, `${r.key}:LEAD`);
-    const rescueUrl = `/correct?key=${encodeURIComponent(r.key)}&label=LEAD&sig=${rescueSig}`;
-    rows.push(
-      `<tr><td>${escapeHtml(r.createdAt.slice(0, 10))}</td><td>${escapeHtml(r.company || '')}</td><td>${escapeHtml(r.name || '')}</td><td>${escapeHtml((r.message || '').slice(0, 100))}</td><td><a href="${rescueUrl}">本物の問い合わせだった（救出）</a></td></tr>`,
-    );
+  let cursor = url.searchParams.get('cursor') || undefined;
+  let listComplete = false;
+  let scanned = 0;
+  let pages = 0;
+  const MAX_SCAN = 1000;
+  // pages 上限は空ページが続く異常系での無限ループ防止
+  while (!listComplete && rows.length < 50 && scanned < MAX_SCAN && pages < 20) {
+    pages++;
+    const list = await env.RECORDS.list({ prefix: 'record:', limit: 100, cursor });
+    for (const key of list.keys) {
+      scanned++;
+      const raw = await env.RECORDS.get(key.name);
+      if (!raw) continue;
+      const r = JSON.parse(raw);
+      if (r.aiLabel !== 'SPAM' || r.humanLabel) continue;
+      if (rows.length >= 50) continue;
+      const rescueSig = await hmacHex(env.CORRECTION_SECRET, `${r.key}:LEAD`);
+      const rescueUrl = `/correct?key=${encodeURIComponent(r.key)}&label=LEAD&sig=${rescueSig}`;
+      rows.push(
+        `<tr><td>${escapeHtml(r.createdAt.slice(0, 10))}</td><td>${escapeHtml(r.company || '')}</td><td>${escapeHtml(r.name || '')}</td><td>${escapeHtml((r.message || '').slice(0, 100))}</td><td><a href="${rescueUrl}">本物の問い合わせだった（救出）</a></td></tr>`,
+      );
+    }
+    listComplete = list.list_complete;
+    if (!listComplete) cursor = list.cursor;
   }
 
+  const moreLink = !listComplete && cursor
+    ? `<p><a href="/quarantine?sig=${encodeURIComponent(sig)}&cursor=${encodeURIComponent(cursor)}">さらに古い記録を見る →</a></p>`
+    : '';
+
   return html(`<h1>隔離ボックス（営業と判定されたもの）</h1>
-<p>直近 ${rows.length} 件。メッセージは削除されず、ここからいつでも救出できます。月1回の確認をおすすめします。</p>
+<p>未対応の SPAM ${rows.length} 件を表示。メッセージは削除されず、ここからいつでも救出できます。月1回の確認をおすすめします。</p>
 <table border="1" cellpadding="6" style="border-collapse:collapse">
 <tr><th>日付</th><th>会社名</th><th>名前</th><th>本文（先頭100字）</th><th>操作</th></tr>
 ${rows.join('\n')}
-</table>`);
+</table>
+${moreLink}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -500,12 +600,26 @@ function json(body, status, headers = {}) {
 function html(body, status = 200) {
   return new Response(
     `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font-family:sans-serif;max-width:720px;margin:3rem auto;padding:0 1rem;line-height:1.8">${body}</body>`,
-    { status, headers: { 'content-type': 'text/html; charset=utf-8', 'x-robots-tag': 'noindex' } },
+    {
+      status,
+      headers: {
+        'content-type': 'text/html; charset=utf-8',
+        'x-robots-tag': 'noindex',
+        // 個人情報と署名付き URL を含むページ: キャッシュとリファラ漏洩を防ぐ
+        'cache-control': 'no-store',
+        'referrer-policy': 'no-referrer',
+      },
+    },
   );
 }
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+
+/** Slack mrkdwn の制御文字を escape（Slack 公式規則: & < > の3つ） */
+function escapeSlackText(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function corsHeaders(env) {
