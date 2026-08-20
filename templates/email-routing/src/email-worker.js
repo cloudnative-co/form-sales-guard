@@ -30,6 +30,11 @@ const ANTHROPIC_VERSION = '2023-06-01';
 const CLASSIFY_TIMEOUT_MS = 45_000;
 const FEW_SHOT_TIMEOUT_MS = 3_000;
 const MAX_REASONING_LENGTH = 500;
+// parse を試みるメールサイズの上限。Email Routing は最大25MiBを受け入れるが、
+// PostalMime.parse の CPU 消費でハンドラが強制終了すると catch にも素通し転送にも
+// 到達しない。フォーム通知メールは通常数十KB 以下なので、これを超える大容量メールは
+// 分類せず素通し転送する（fail-open: メールを落とさない）
+const MAX_PARSE_SIZE = 1_000_000;
 // 隔離時に保存する本文の上限。保存されるのはテキスト本文（無ければ HTML）の
 // 先頭1万文字のみで、添付ファイルと raw MIME は保存されない（KV 保存の制約）。
 // 救出画面・README の文言はこの制約と一致させること
@@ -45,7 +50,7 @@ export default {
   // -------------------------------------------------------------------------
   // メール受信（Email Routing のルールでこの Worker に向けたアドレス宛のみ届く）
   // -------------------------------------------------------------------------
-  async email(message, env, ctx) {
+  async email(message, env) {
     const missing = ['ANTHROPIC_API_KEY', 'CORRECTION_SECRET', 'DESTINATION_ADDRESS'].filter((k) => !env[k]);
     if (!env.RECORDS) missing.push('RECORDS (KVバインディング)');
     if (missing.length > 0) {
@@ -59,6 +64,16 @@ export default {
     if (env.FORM_SENDER && !message.from.toLowerCase().includes(env.FORM_SENDER.toLowerCase())) {
       const h = new Headers();
       h.set('X-FormGuard-Label', 'SKIPPED');
+      await message.forward(env.DESTINATION_ADDRESS, h);
+      return;
+    }
+
+    // 大容量メールは parse せず素通し転送（PostalMime.parse の CPU 消費でハンドラが
+    // 強制終了し、catch にも転送にも到達しない事故を防ぐ）
+    if (typeof message.rawSize === 'number' && message.rawSize > MAX_PARSE_SIZE) {
+      console.warn(`Email too large to classify (${message.rawSize} bytes), forwarding as-is`);
+      const h = new Headers();
+      h.set('X-FormGuard-Label', 'SKIPPED-LARGE');
       await message.forward(env.DESTINATION_ADDRESS, h);
       return;
     }
@@ -97,7 +112,10 @@ export default {
     };
     let stored = true;
     try {
-      await env.RECORDS.put(recordKey, JSON.stringify(record));
+      // metadata は /quarantine が本文を get せず SPAM を絞り込むための索引
+      await env.RECORDS.put(recordKey, JSON.stringify(record), {
+        metadata: { label: result.label, corrected: false },
+      });
     } catch (error) {
       console.error(`Record save failed: ${message2(error)}`);
       stored = false;
@@ -120,15 +138,31 @@ export default {
         await message.forward(env.DESTINATION_ADDRESS, h);
       } catch (error) {
         // 転送失敗を throw すると下の notify に到達せず、非SPAMは隔離ボックスにも
-        // 出ないため完全に不可視になる。捕捉して Slack 通知に倒す（fail-open）
+        // 出ないため完全に不可視になる。捕捉して Slack 通知に倒す（fail-open）。
+        // 保存できている場合は forwardFailed を永続化し、後から気づけるようにする
         console.error(`Forward failed: ${message2(error)}`);
         record.forwardFailed = true;
+        if (stored) {
+          try {
+            await env.RECORDS.put(recordKey, JSON.stringify(record), {
+              metadata: { label: result.label, corrected: false },
+            });
+          } catch (e) {
+            console.error(`Record update (forwardFailed) failed: ${message2(e)}`);
+          }
+        }
       }
     }
 
-    // Slack 通知（LEAD/REVIEW は SLACK_WEBHOOK_URL、SPAM は SLACK_WEBHOOK_SPAM。未設定なら省略）。
-    // 転送の成否に関わらず必ずスケジュールする
-    ctx.waitUntil(notify(env, record));
+    // Slack 通知（未設定なら省略）。転送の成否に関わらず必ず実行し、成否を得る。
+    // ctx.waitUntil ではなく await: email ハンドラには送信者への同期応答が無いため待てる
+    const notified = await notify(env, record);
+
+    // 非SPAM で「転送も保存も通知も」全て失敗した最悪ケースだけは、正常終了せず throw して
+    // Cloudflare にメールを委ねる（バウンス/リトライで送信者に失敗が伝わり、完全消失を防ぐ）
+    if (!isSpam && record.forwardFailed && !stored && !notified) {
+      throw new Error('All delivery paths failed (no forward, no storage, no notification)');
+    }
   },
 
   // -------------------------------------------------------------------------
@@ -153,10 +187,9 @@ export default {
 // ---------------------------------------------------------------------------
 
 async function classify(env, subject, text, examples) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CLASSIFY_TIMEOUT_MS);
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), CLASSIFY_TIMEOUT_MS);
-
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       signal: controller.signal,
@@ -182,9 +215,11 @@ ${stripUntrustedTags(text.slice(0, 2000))}
           },
         ],
       }),
-    }).finally(() => clearTimeout(timer));
+    });
 
     if (!response.ok) throw new Error(`API error: HTTP ${response.status}`);
+    // clearTimeout は body 読み取り後（finally）まで遅らせる。headers 受信時点で解除すると
+    // サーバーが body を送らない場合に response.json() が無期限ハングする
     const body = await response.json();
 
     const textBlock = Array.isArray(body.content) ? body.content.find((b) => b && b.type === 'text') : null;
@@ -195,6 +230,8 @@ ${stripUntrustedTags(text.slice(0, 2000))}
   } catch (error) {
     console.error(`Classification failed: ${message2(error)}`); // 検知との契約文言（PITFALLS F-1）
     return { ...FALLBACK_RESULT, failed: true };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -280,11 +317,12 @@ async function getFewShotExamples(env) {
 // 通知（never-reject）
 // ---------------------------------------------------------------------------
 
+/** 通知を試み、実際に投稿できたら true を返す（email ハンドラの全滅判定に使う） */
 async function notify(env, record) {
   try {
     const isSpam = record.aiLabel === 'SPAM' && !record.classificationFailed && !record.storageFailed;
     const webhook = isSpam ? env.SLACK_WEBHOOK_SPAM : env.SLACK_WEBHOOK_URL;
-    if (!webhook) return; // メール転送自体が主通知なので、Slack は任意
+    if (!webhook) return false; // メール転送自体が主通知なので、Slack は任意
 
     const emoji = { LEAD: ':tada:', REVIEW: ':thinking_face:', SPAM: ':wastebasket:' }[record.aiLabel] || ':question:';
     const warn = [
@@ -308,12 +346,19 @@ ${links}`;
       body: JSON.stringify({ text, unfurl_links: false, unfurl_media: false }),
     });
     if (!res.ok) throw new Error(`Webhook HTTP ${res.status}`);
+    return true;
   } catch (error) {
     console.error(`Notification failed: ${message2(error)}`);
+    return false;
   }
 }
 
 async function correctionLinks(env, record) {
+  // CORRECTION_SECRET 欠落時はリンク生成を諦めるが通知自体は出す（リンク生成の失敗で
+  // notify 全体を落として Slack 通知を消さない）
+  if (!env.CORRECTION_SECRET) {
+    return ':warning: 修正リンクは未生成（CORRECTION_SECRET が未設定です。設定して再デプロイしてください）';
+  }
   const base = env.PUBLIC_URL || '';
   const targets = ['LEAD', 'SPAM'].filter((l) => l !== record.aiLabel); // 同一ラベルは出さない（PITFALLS D-4）
   const links = [];
@@ -387,7 +432,10 @@ async function handleCorrectSubmit(request, env) {
 
   record.humanLabel = label; // aiLabel は上書きしない（PITFALLS D-5）
   record.correctedAt = new Date().toISOString();
-  await env.RECORDS.put(key, JSON.stringify(record));
+  // metadata.corrected=true で /quarantine の絞り込みから外す（救出済みは表示しない）
+  await env.RECORDS.put(key, JSON.stringify(record), {
+    metadata: { label: record.aiLabel, corrected: true },
+  });
 
   await env.RECORDS.put(
     `correction:${reverseTimestamp()}:${crypto.randomUUID()}`,
@@ -411,11 +459,10 @@ async function handleQuarantine(url, env) {
   const expected = await hmacHex(env.CORRECTION_SECRET, 'quarantine');
   if (!timingSafeEqualHex(sig, expected)) return html('リンクの署名が正しくありません。', 403);
 
-  // list() は 1 回で全件を返さない（cursor 付きページング）。先頭ページだけ見ると
-  // 新着 LEAD/REVIEW に押し出された古い SPAM が永久に見えなくなる。
-  // limit を「あと表示できる件数」に絞ることで、取得したキーを捨てずに済ませる
-  // （取得キーを捨てて cursor を次ページへ進めると、同一ページの未表示 SPAM が
-  //  二度と取得されない — これが前バージョンの取りこぼしバグだった）。
+  // 本文（record 全体）を全件 get すると、KV の 1 invocation あたりの操作数上限
+  // （約1000）に達し、隔離ボックス自体が返せなくなる。put 時に付与した metadata
+  // {label, corrected} を list（返却キー数に関わらず 1 操作）で読み、SPAM 未修正だけに
+  // 絞ってから本文を get する。get は表示する分（最大50）にほぼ限定される。
   const rows = [];
   let cursor = url.searchParams.get('cursor') || undefined;
   let listComplete = false;
@@ -423,8 +470,12 @@ async function handleQuarantine(url, env) {
   const MAX_PAGES = 40;
   while (!listComplete && rows.length < 50 && pages < MAX_PAGES) {
     pages++;
-    const list = await env.RECORDS.list({ prefix: 'record:', limit: 50 - rows.length, cursor });
+    const list = await env.RECORDS.list({ prefix: 'record:', limit: 1000, cursor });
     for (const key of list.keys) {
+      if (rows.length >= 50) break;
+      const m = key.metadata;
+      // metadata があれば SPAM 以外・修正済み・未分類(label:null)を get せず除外
+      if (m && (m.label !== 'SPAM' || m.corrected)) continue;
       const raw = await env.RECORDS.get(key.name);
       if (!raw) continue;
       const r = JSON.parse(raw);

@@ -101,7 +101,7 @@ description: お問い合わせフォームに届く営業スパム（フォー�
    - 実行前に伝える: 「検収サンプルの本文は、判定のため Anthropic の API に送信されます（本番の分類と同一の経路です。他には送られません）」
    - プロジェクト内に `samples/` を作り、Step 2-3 で取り置いた**検収用**の実例を `lead_01.txt` / `spam_01.txt` の命名で保存（LEAD と SPAM は各1件以上必須。テンプレート同梱の `.gitignore` で除外されていることを確認）
    - `node <このリポジトリ>/tools/eval.mjs <プロジェクトのパス>` を実行（キーは `.dev.vars` から自動で読まれる）し、正解率・ラベル別内訳・**リード喪失方向の誤り（LEAD→SPAM）**を利用者に見せる
-   - 経路C を選んだ場合: 検収スクリプトは `src/criteria.js` 形式を読むため、`processor.ts` の `CRITERIA` と同内容の `criteria.js` を一時的に生成して検収し、終わったら削除する
+   - 経路C を選んだ場合: 検収スクリプト（tools/eval.mjs）は `src/criteria.js`（JS）を読むため、`src/criteria.ts` の `CRITERIA` と同内容の `src/criteria.js` を一時生成して検収し、終わったら削除する（criteria.js も `.gitignore` 済み）
    - 外れた例があれば類型を基準に追記して再実行（このとき検収用の例を基準生成に転用したら、その例はもう検収に使えない）
    - **終わったら `samples/` を削除する**（`.dev.vars` は経路A/B のローカル開発でも使うため残してよい）
 4. デプロイ手順:
@@ -115,12 +115,12 @@ description: お問い合わせフォームに届く営業スパム（フォー�
 5. **デプロイ後の仕上げ（スキップするとリンクが壊れる）**:
    - deploy で表示された URL を `wrangler.toml` の `PUBLIC_URL` に設定して**再デプロイ**（未設定だと通知内の修正リンクが壊れる）
    - 隔離ボックスの URL を生成して利用者に渡す（ブックマークを推奨）: `<PUBLIC_URL>/quarantine?sig=<署名>`。署名は `HMAC-SHA256(CORRECTION_SECRET, "quarantine")` の16進表現
-   - **初期 few-shot の投入**: Step 2-5 で選んだ境界例を、修正済みレコードと同じ形式で KV に入れる。キーは `correction:<(9999999999999 − 現在のUnixミリ秒) を13桁ゼロ埋め>:<UUID>`、値は `{"company":"<会社名>","messageExcerpt":"<本文の先頭200字>","correctLabel":"LEAD|SPAM"}`（経路Bは company 不要）。**値（営業文面を含む）をシェルのコマンドライン引数に直接埋め込まないこと** — 営業文面は外部の送信者由来で、引用符や `;` `$( )` などがセットアップ端末上でコマンドを破壊・任意実行しうる。値は Write ツールで一時 JSON ファイルに書き出し、`--path` で渡す:
+   - **初期 few-shot の投入**: Step 2-5 で選んだ境界例を、修正済みレコードと同じ形式で KV に入れる。キーは `correction:<(9999999999999 − 現在のUnixミリ秒) を13桁ゼロ埋め>:<UUID>`、値は `{"company":"<会社名>","messageExcerpt":"<本文の先頭200字>","correctLabel":"LEAD|SPAM"}`（経路Bは company 不要）。**値（営業文面を含む）をシェルのコマンドライン引数に直接埋め込まないこと** — 営業文面は外部の送信者由来で、引用符や `;` `$( )` などがセットアップ端末上でコマンドを破壊・任意実行しうる。値は Write ツールで一時 JSON ファイルに書き出し、`--path` で渡す。**顧客文面を含むため、置き場所は `.gitignore` 済みの `samples/` 配下**（BOM なし UTF-8）にし、**投入の成否に関わらず終了時に必ず削除する**:
      ```
-     # <値> をコマンドラインに書かず、一時ファイル経由で投入する
-     npx wrangler kv key put --binding RECORDS --remote "<キー>" --path <値を書いた一時ファイル>
+     # <値> をコマンドラインに書かず、gitignore 済みの一時ファイル経由で投入する
+     npx wrangler kv key put --binding RECORDS --remote "<キー>" --path samples/_fewshot.json
      ```
-     投入後は一時ファイルを削除し、テスト分類でプロンプトに反映されることを確認
+     投入後（失敗・中断時も含め）`samples/_fewshot.json` を削除し、テスト分類でプロンプトに反映されることを確認。BOM 付きで書くと本番の `JSON.parse` が失敗し few-shot が空になるため、必ず BOM なしにすること
 6. **費用の上限設定（スキップ禁止 — 安全不変条件7）**: Anthropic Console の利用上限（想定月額の3〜5倍）と、Cloudflare / AWS の費用通知の設定を、画面の場所を案内しながら一緒に行う
 
 ## Step 5: 動作検証（必ず利用者と一緒に行う）

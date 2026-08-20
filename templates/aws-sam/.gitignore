@@ -6,7 +6,10 @@ samconfig.toml
 .dev.vars
 .dev.vars.*
 # 判定基準は機微情報（自社に届いた営業の観測から生成）。standalone copy でも追跡しない
+# （criteria.example.ts はテンプレートに含めるが、生成される criteria.ts/.js は除外）
 criteria.js
+criteria.ts
 src/criteria.js
+src/criteria.ts
 # 検収用の実例メール（tools/eval.mjs 用）。個人情報を含むため絶対にコミットしない
 samples/

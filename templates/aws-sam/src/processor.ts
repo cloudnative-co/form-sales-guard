@@ -20,32 +20,20 @@ import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-sec
 import {
   createClaudeClient,
   classifyContact,
-  type ClassificationCriteria,
   type ClassificationResult,
   type ClassificationLabel,
   type FewShotExample,
 } from './claude.js';
 import type { FormInput, ProcessorMessage } from './classifier.js';
+// 判定基準は gitignore 済みの criteria.ts に分離する（機微な会社知識・営業類型を
+// tracked な processor.ts に書かせない — standalone copy での誤コミットを防ぐ）。
+// criteria.example.ts をコピーして criteria.ts を生成する（README の手順参照）
+import { CRITERIA } from './criteria.js';
 
 const log = {
   info: (msg: string, data?: object) => console.log(JSON.stringify({ level: 'info', msg, ...data })),
   warn: (msg: string, data?: object) => console.warn(JSON.stringify({ level: 'warn', msg, ...data })),
   error: (msg: string, data?: object) => console.error(JSON.stringify({ level: 'error', msg, ...data })),
-};
-
-// ---------------------------------------------------------------------------
-// 判定基準（導入者が生成して差し替える）
-// prompts/classifier-skeleton.md の手順で、実際に届いた営業メッセージから
-// 類型化して生成する。生成した基準は導入者のものであり、公開リポジトリに
-// 投稿しない。以下はプレースホルダー。
-// ---------------------------------------------------------------------------
-const CRITERIA: ClassificationCriteria = {
-  companyName: 'YOUR_COMPANY_NAME',
-  companyBlock: `## 会社について
-（prompts/classifier-skeleton.md のブロック①をここに生成する）`,
-  labelBlock: `## 分類ラベル
-（prompts/classifier-skeleton.md のブロック②をここに生成する。
-LEAD/SPAM/REVIEW の 3 ラベル構成は変えないこと）`,
 };
 
 // few-shot 取得は付加価値機能にすぎない。短いタイムアウト + キャッシュ + 失敗時は

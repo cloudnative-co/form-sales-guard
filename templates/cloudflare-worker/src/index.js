@@ -19,7 +19,11 @@ import { COMPANY_NAME, COMPANY_BLOCK, LABEL_BLOCK } from './criteria.js';
 
 const DEFAULT_MODEL = 'claude-sonnet-5';
 const ANTHROPIC_VERSION = '2023-06-01';
-const CLASSIFY_TIMEOUT_MS = 45_000; // waitUntil の実行余地より短く（PITFALLS A-5: タイムアウトの階層）
+// Cloudflare は HTTP 応答後の waitUntil() を約30秒で打ち切る。few-shot 取得(3s) +
+// 分類(この値) + KV 更新 + 通知 が 30 秒に収まるよう、分類タイムアウトを 20 秒にする。
+// 45 秒だと AI が 30 秒超ハングしたとき、abort/catch/REVIEW 保存より先に waitUntil が
+// キャンセルされ、fail-open にも検知にも乗らない。
+const CLASSIFY_TIMEOUT_MS = 20_000;
 const FEW_SHOT_TIMEOUT_MS = 3_000; // few-shot 取得で分類本体を止めない（PITFALLS A-7）
 const MIN_SUBMIT_SECONDS = 3; // これ未満の送信はボットとみなし黙殺（PITFALLS E-1）
 const MAX_REASONING_LENGTH = 500;
@@ -126,7 +130,9 @@ async function handleSubmit(request, env, ctx) {
   };
 
   try {
-    await env.RECORDS.put(recordKey, JSON.stringify(record));
+    // metadata は /quarantine が本文を get せず SPAM を絞り込むための索引（label は
+    // 分類前なので null。processSubmission で確定値に更新される）
+    await env.RECORDS.put(recordKey, JSON.stringify(record), { metadata: { label: null, corrected: false } });
   } catch (error) {
     // 記録より受付を優先して継続（縮退）。ただし修正リンクは使えない旨をログに残す
     console.error(`Record save failed: ${message(error)}`);
@@ -147,7 +153,10 @@ async function processSubmission(env, record) {
   record.classificationFailed = result.failed === true;
 
   try {
-    await env.RECORDS.put(record.key, JSON.stringify(record));
+    // metadata の label/corrected は /quarantine の絞り込み索引（本文 get を減らす）
+    await env.RECORDS.put(record.key, JSON.stringify(record), {
+      metadata: { label: record.aiLabel, corrected: false },
+    });
   } catch (error) {
     // 保存できていないレコードは隔離ボックスに現れない。SPAM 判定のまま通知も
     // 抑止すると問い合わせが完全に不可視になるため、保存失敗時は SPAM 扱いを
@@ -164,10 +173,9 @@ async function processSubmission(env, record) {
 // ---------------------------------------------------------------------------
 
 async function classify(env, record, examples) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CLASSIFY_TIMEOUT_MS);
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), CLASSIFY_TIMEOUT_MS);
-
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       signal: controller.signal,
@@ -183,12 +191,15 @@ async function classify(env, record, examples) {
         system: buildSystemPrompt(examples),
         messages: [{ role: 'user', content: buildUserMessage(record) }],
       }),
-    }).finally(() => clearTimeout(timer));
+    });
 
     if (!response.ok) {
       throw new Error(`API error: HTTP ${response.status}`);
     }
 
+    // clearTimeout は body 読み取り後（finally）まで遅らせる。fetch 解決（headers 受信）
+    // の時点で timer を解除すると、サーバーが body を送らない場合に response.json() が
+    // タイムアウトなしで無期限ハングする（signal が同じ controller なので finally 前は保護される）
     const body = await response.json();
 
     // 思考有効時は content[0] が thinking ブロックのことがある（PITFALLS A-2）
@@ -202,6 +213,8 @@ async function classify(env, record, examples) {
     // この文言は検知（アラーム・⚠️通知）との契約。変更しないこと（PITFALLS F-1）
     console.error(`Classification failed: ${message(error)}`);
     return { ...FALLBACK_RESULT, failed: true };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -378,6 +391,11 @@ ${links}`;
 
 /** AI 判定と同じラベルの修正リンクは出さない（PITFALLS D-4） */
 async function correctionLinks(env, record) {
+  // CORRECTION_SECRET 欠落時はリンク生成を諦めるが、通知自体は必ず出す（リンク生成の
+  // 失敗で notify 全体を落として Slack 通知を消さない）
+  if (!env.CORRECTION_SECRET) {
+    return ':warning: 修正リンクは未生成（CORRECTION_SECRET が未設定です。設定して再デプロイしてください）';
+  }
   const base = env.PUBLIC_URL || '';
   const targets = ['LEAD', 'SPAM'].filter((l) => l !== record.aiLabel);
   const links = [];
@@ -463,7 +481,10 @@ async function handleCorrectSubmit(request, env) {
   // AI の元判定（aiLabel）は上書きしない（PITFALLS D-5）
   record.humanLabel = label;
   record.correctedAt = new Date().toISOString();
-  await env.RECORDS.put(key, JSON.stringify(record));
+  // metadata.corrected=true で /quarantine の絞り込みから外す（救出済みは表示しない）
+  await env.RECORDS.put(key, JSON.stringify(record), {
+    metadata: { label: record.aiLabel, corrected: true },
+  });
 
   // few-shot 例として保存（文面は先頭 200 字のみ）
   const correctionKey = `correction:${reverseTimestamp()}:${crypto.randomUUID()}`;
@@ -493,12 +514,10 @@ async function handleQuarantine(url, env) {
     return html('リンクの署名が正しくありません。', 403);
   }
 
-  // list() は 1 回で全件を返さない（cursor 付きページング）。先頭ページだけ見ると
-  // 新着 LEAD/REVIEW に押し出された古い SPAM が永久に見えなくなる。
-  // limit を「あと表示できる件数」に絞ることで、取得したキーを捨てずに済ませる
-  // （取得キーを捨てて cursor を次ページへ進めると、同一ページの未表示 SPAM が
-  //  二度と取得されない — これが前バージョンの取りこぼしバグだった）。
-  // pages 上限は SPAM 以外だけのページが続く場合の打ち切り。
+  // 本文（record 全体）を全件 get すると、KV の 1 invocation あたりの操作数上限
+  // （約1000）に達し、隔離ボックス自体が返せなくなる。put 時に付与した metadata
+  // {label, corrected} を list（返却キー数に関わらず 1 操作）で読み、SPAM 未修正だけに
+  // 絞ってから本文を get する。get は表示する分（最大50）にほぼ限定される。
   const rows = [];
   let cursor = url.searchParams.get('cursor') || undefined;
   let listComplete = false;
@@ -506,8 +525,13 @@ async function handleQuarantine(url, env) {
   const MAX_PAGES = 40;
   while (!listComplete && rows.length < 50 && pages < MAX_PAGES) {
     pages++;
-    const list = await env.RECORDS.list({ prefix: 'record:', limit: 50 - rows.length, cursor });
+    const list = await env.RECORDS.list({ prefix: 'record:', limit: 1000, cursor });
     for (const key of list.keys) {
+      if (rows.length >= 50) break;
+      const m = key.metadata;
+      // metadata があれば SPAM 以外・修正済み・未分類(label:null)を get せず除外。
+      // metadata が無い旧データのみ get して中身で判定する（新規デプロイは全件付与済み）
+      if (m && (m.label !== 'SPAM' || m.corrected)) continue;
       const raw = await env.RECORDS.get(key.name);
       if (!raw) continue;
       const r = JSON.parse(raw);
