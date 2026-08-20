@@ -39,11 +39,15 @@ const FALLBACK_RESULT = Object.freeze({
 
 export default {
   async fetch(request, env, ctx) {
-    // 必須設定の fail-fast 検証（PITFALLS B-4）
-    const missing = ['ANTHROPIC_API_KEY', 'CORRECTION_SECRET'].filter((k) => !env[k]);
-    if (!env.RECORDS) missing.push('RECORDS (KVバインディング)');
-    if (missing.length > 0) {
-      console.error(`Missing required configuration: ${missing.join(', ')}`);
+    // KV は全機能（受付・分類・隔離・修正）の基盤なので、唯一の「全 endpoint 共通の
+    // 必須設定」として fail-fast する（PITFALLS B-4）。一方 ANTHROPIC_API_KEY と
+    // CORRECTION_SECRET は endpoint 別にしか要らないため、ここで全体を止めない:
+    // これらを全 endpoint 必須にすると、API キー欠落だけで /submit も /quarantine も
+    // 500 になり、受付と救出を LLM 設定の有無に道連れにする（原則1/3 に反する）。
+    // API キー欠落時は classify() が 401 で失敗し REVIEW に倒れる＝ fail-open。
+    // CORRECTION_SECRET は /correct・/quarantine 側で個別に検証する。
+    if (!env.RECORDS) {
+      console.error('Missing required configuration: RECORDS (KVバインディング)');
       return new Response('Server configuration error', { status: 500 });
     }
 
@@ -249,9 +253,10 @@ function stripUntrustedTags(s) {
   return out;
 }
 
-/** タグ外に置く短フィールド用: タグ偽装に加えて改行も除去（指示行の注入防止） */
+/** タグ外に置く短フィールド用: タグ偽装に加えて改行も除去（指示行の注入防止）。
+ *  U+2028/U+2029/U+0085 も行区切りとして機能するため空白に正規化する */
 function inlineUntrusted(s) {
-  return stripUntrustedTags(s).replace(/[\r\n]+/g, ' ');
+  return stripUntrustedTags(s).replace(/[\r\n\u0085\u2028\u2029]+/g, ' ');
 }
 
 function buildSystemPrompt(examples) {
@@ -390,6 +395,9 @@ async function correctionLinks(env, record) {
 
 /** key/label/sig の検証（署名検証はレコード読み込みより先 — PITFALLS D-1 と同じ原則） */
 async function verifyCorrectionParams(env, key, label, sig) {
+  if (!env.CORRECTION_SECRET) {
+    return html('サーバーの設定が未完了です（CORRECTION_SECRET が未設定）。', 500);
+  }
   if (!['LEAD', 'REVIEW', 'SPAM'].includes(label) || !key.startsWith('record:')) {
     return html('リンクが正しくありません。', 400);
   }
@@ -476,6 +484,9 @@ async function handleCorrectSubmit(request, env) {
 // ---------------------------------------------------------------------------
 
 async function handleQuarantine(url, env) {
+  if (!env.CORRECTION_SECRET) {
+    return html('サーバーの設定が未完了です（CORRECTION_SECRET が未設定）。', 500);
+  }
   const sig = url.searchParams.get('sig') || '';
   const expected = await hmacHex(env.CORRECTION_SECRET, 'quarantine');
   if (!timingSafeEqualHex(sig, expected)) {
@@ -483,25 +494,24 @@ async function handleQuarantine(url, env) {
   }
 
   // list() は 1 回で全件を返さない（cursor 付きページング）。先頭ページだけ見ると
-  // 新着 LEAD/REVIEW に押し出された古い SPAM が永久に見えなくなるため、
-  // 50 件集まるか走査上限に達するまでページを進め、続きへのリンクも出す
+  // 新着 LEAD/REVIEW に押し出された古い SPAM が永久に見えなくなる。
+  // limit を「あと表示できる件数」に絞ることで、取得したキーを捨てずに済ませる
+  // （取得キーを捨てて cursor を次ページへ進めると、同一ページの未表示 SPAM が
+  //  二度と取得されない — これが前バージョンの取りこぼしバグだった）。
+  // pages 上限は SPAM 以外だけのページが続く場合の打ち切り。
   const rows = [];
   let cursor = url.searchParams.get('cursor') || undefined;
   let listComplete = false;
-  let scanned = 0;
   let pages = 0;
-  const MAX_SCAN = 1000;
-  // pages 上限は空ページが続く異常系での無限ループ防止
-  while (!listComplete && rows.length < 50 && scanned < MAX_SCAN && pages < 20) {
+  const MAX_PAGES = 40;
+  while (!listComplete && rows.length < 50 && pages < MAX_PAGES) {
     pages++;
-    const list = await env.RECORDS.list({ prefix: 'record:', limit: 100, cursor });
+    const list = await env.RECORDS.list({ prefix: 'record:', limit: 50 - rows.length, cursor });
     for (const key of list.keys) {
-      scanned++;
       const raw = await env.RECORDS.get(key.name);
       if (!raw) continue;
       const r = JSON.parse(raw);
       if (r.aiLabel !== 'SPAM' || r.humanLabel) continue;
-      if (rows.length >= 50) continue;
       const rescueSig = await hmacHex(env.CORRECTION_SECRET, `${r.key}:LEAD`);
       const rescueUrl = `/correct?key=${encodeURIComponent(r.key)}&label=LEAD&sig=${rescueSig}`;
       rows.push(
@@ -509,7 +519,7 @@ async function handleQuarantine(url, env) {
       );
     }
     listComplete = list.list_complete;
-    if (!listComplete) cursor = list.cursor;
+    cursor = list.cursor;
   }
 
   const moreLink = !listComplete && cursor

@@ -60,8 +60,15 @@ export interface ProcessorMessage {
   recordId: string;
 }
 
-const sqsClient = new SQSClient({});
-const ddbClient = new DynamoDBClient({});
+// AWS SDK v3 の既定 requestTimeout は無制限。同期 Lambda（Timeout 25s < API GW 29s）で
+// SQS / DynamoDB がハングすると 25s で強制終了し、クライアントは 5xx で再送しうる。
+// 明示タイムアウトで内側を短くする。
+const AWS_CLIENT_CONFIG = {
+  requestHandler: { requestTimeout: 8_000, connectionTimeout: 3_000 },
+  maxAttempts: 2,
+};
+const sqsClient = new SQSClient(AWS_CLIENT_CONFIG);
+const ddbClient = new DynamoDBClient(AWS_CLIENT_CONFIG);
 
 // 必須設定は起動時に fail-fast で検証する（PITFALLS B-4）。欠落をリクエスト処理中の
 // 不可解なエラーではなく、デプロイ直後の明確なエラーとして検知させる。

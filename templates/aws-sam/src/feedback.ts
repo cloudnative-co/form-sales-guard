@@ -25,8 +25,15 @@ const log = {
   error: (msg: string, data?: object) => console.error(JSON.stringify({ level: 'error', msg, ...data })),
 };
 
-const ddbClient = new DynamoDBClient({});
-const smClient = new SecretsManagerClient({});
+// AWS SDK v3 の既定 requestTimeout は無制限。Slack の 3 秒 ack 要件（PITFALLS D）に対し、
+// DynamoDB / Secrets がハングすると Lambda 25s まで粘って Slack 側にエラー表示が出る。
+// 明示タイムアウトで内側を短くする（厳密な 3 秒 ack には非同期化が必要 — README 参照）。
+const AWS_CLIENT_CONFIG = {
+  requestHandler: { requestTimeout: 8_000, connectionTimeout: 3_000 },
+  maxAttempts: 2,
+};
+const ddbClient = new DynamoDBClient(AWS_CLIENT_CONFIG);
+const smClient = new SecretsManagerClient(AWS_CLIENT_CONFIG);
 
 interface Secrets {
   SLACK_BOT_TOKEN: string;

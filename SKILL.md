@@ -115,7 +115,12 @@ description: お問い合わせフォームに届く営業スパム（フォー�
 5. **デプロイ後の仕上げ（スキップするとリンクが壊れる）**:
    - deploy で表示された URL を `wrangler.toml` の `PUBLIC_URL` に設定して**再デプロイ**（未設定だと通知内の修正リンクが壊れる）
    - 隔離ボックスの URL を生成して利用者に渡す（ブックマークを推奨）: `<PUBLIC_URL>/quarantine?sig=<署名>`。署名は `HMAC-SHA256(CORRECTION_SECRET, "quarantine")` の16進表現
-   - **初期 few-shot の投入**: Step 2-5 で選んだ境界例を、修正済みレコードと同じ形式で KV に入れる。キーは `correction:<(9999999999999 − 現在のUnixミリ秒) を13桁ゼロ埋め>:<UUID>`、値は `{"company":"<会社名>","messageExcerpt":"<本文の先頭200字>","correctLabel":"LEAD|SPAM"}`（経路Bは company 不要）。`npx wrangler kv key put --binding RECORDS --remote "<キー>" '<値>'` で投入し、投入後にテスト分類でプロンプトに反映されることを確認
+   - **初期 few-shot の投入**: Step 2-5 で選んだ境界例を、修正済みレコードと同じ形式で KV に入れる。キーは `correction:<(9999999999999 − 現在のUnixミリ秒) を13桁ゼロ埋め>:<UUID>`、値は `{"company":"<会社名>","messageExcerpt":"<本文の先頭200字>","correctLabel":"LEAD|SPAM"}`（経路Bは company 不要）。**値（営業文面を含む）をシェルのコマンドライン引数に直接埋め込まないこと** — 営業文面は外部の送信者由来で、引用符や `;` `$( )` などがセットアップ端末上でコマンドを破壊・任意実行しうる。値は Write ツールで一時 JSON ファイルに書き出し、`--path` で渡す:
+     ```
+     # <値> をコマンドラインに書かず、一時ファイル経由で投入する
+     npx wrangler kv key put --binding RECORDS --remote "<キー>" --path <値を書いた一時ファイル>
+     ```
+     投入後は一時ファイルを削除し、テスト分類でプロンプトに反映されることを確認
 6. **費用の上限設定（スキップ禁止 — 安全不変条件7）**: Anthropic Console の利用上限（想定月額の3〜5倍）と、Cloudflare / AWS の費用通知の設定を、画面の場所を案内しながら一緒に行う
 
 ## Step 5: 動作検証（必ず利用者と一緒に行う）

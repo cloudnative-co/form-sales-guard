@@ -65,11 +65,13 @@ export const createClaudeClient = (apiKey: string): Anthropic => {
   // SDK 既定（タイムアウト 10 分・リトライ 2 回）は Lambda Timeout 120s を大幅に
   // 超える（PITFALLS A-5）。既定のままだと API ハング時に Lambda 側のタイムアウトで
   // 死に、"Classification failed" ログが出ず検知アラームにも乗らない。
-  // 注意: SDK はタイムアウト自体もリトライ対象のため、階層の比較は 1 試行ではなく
-  // 「timeout × (maxRetries + 1) + バックオフ」の総所要で行う。
-  // 45s × 2 試行 + バックオフ ≈ 92s < Lambda 120s（残りは記録更新・Slack 通知の余裕）。
-  // 60s のままだと 2 試行で 120s を超え、REVIEW フォールバックに到達できない。
-  return new Anthropic({ apiKey, timeout: 45_000, maxRetries: 1 });
+  // 注意: SDK はタイムアウトも 429 も Retry-After に従って再試行するため、maxRetries>0
+  // だと「timeout × 試行数」では読めない待機が入り、Lambda 120s の外側タイムアウトに
+  // 到達しうる（catch も検知ログも実行されない）。maxRetries: 0 で再試行を断ち、
+  // 単一 60s タイムアウトを分類処理のハード上限にする（残り 60s は Secrets 取得・
+  // few-shot・記録更新・Slack 通知の余地。それらの AWS SDK 呼び出しにも
+  // タイムアウトを明示すること — processor.ts / classifier.ts / feedback.ts 参照）。
+  return new Anthropic({ apiKey, timeout: 60_000, maxRetries: 0 });
 };
 
 /**
@@ -88,8 +90,10 @@ const stripUntrustedTags = (s: string): string => {
   return out;
 };
 
-/** タグ外に置く短フィールド用: タグ偽装に加えて改行も除去（指示行の注入防止） */
-const inlineUntrusted = (s: string): string => stripUntrustedTags(s).replace(/[\r\n]+/g, ' ');
+/** タグ外に置く短フィールド用: タグ偽装に加えて改行も除去（指示行の注入防止）。
+ *  U+2028/U+2029/U+0085 も行区切りとして機能するため空白に正規化する */
+const inlineUntrusted = (s: string): string =>
+  stripUntrustedTags(s).replace(/[\r\n\u0085\u2028\u2029]+/g, ' ');
 
 /** システムプロンプト = 固定の前文 + 注入された判定基準 + 固定の出力形式 */
 const buildSystemPrompt = (criteria: ClassificationCriteria): string => `あなたは企業の問い合わせフォームを分類するAIアシスタントです。

@@ -113,6 +113,7 @@ DynamoDB に単純化しているが、以下のインターフェースで差�
 - **SQS の重複配送に対する冪等性がない**: SQS 標準キューは at-least-once 配送であり、稀な重複配送時は Slack 通知が二重に投稿され、後着の `slackMessageTs` が先着を上書きする（問い合わせデータ自体は壊れない）。厳密にするなら recordId ベースの条件付き状態遷移（`received`→`processing` の conditional update）を入れる
 - **修正ボタンの処理が同期的**: Slack の 3 秒 ack 要件に対し、Secrets 取得〜GSI Query〜UpdateItem〜chat.update を完了してから 200 を返すため、遅延時は Slack 側にエラー表示が出ることがある（**DB への記録は成功していることがある**。メッセージのボタンが残っていれば再度押してよい — 記録済みなら no-op になる）。また GSI は結果整合のため、通知の投稿直後にボタンを押すと逆引きに失敗して無視されることがある（数秒待って押し直せばよい）。厳密にするなら署名検証後に即 ack して処理を非同期化する
 - **DynamoDB 保存と SQS 送信が非トランザクション**: PutItem 成功後に SendMessage が失敗すると `received` のまま処理されないレコードが残る（クライアントには 500 が返るため利用者は再送できる）。厳密にするなら outbox パターンか未投入レコードの定期照合を入れる
+- **Processor の SQS 実行ロールは全キュー対象**: DynamoDB/Secrets の IAM は最小化したが、SAM が SQS イベントソース用に付与する実行ロール（`AWSLambdaSQSQueueExecutionRole`）は `ReceiveMessage`/`DeleteMessage` の Resource が `*`（全キュー）になる。厳密には Processor に custom role を指定し、対象 `ProcessingQueue` の ARN だけに限定する
 
 ## 変えてはいけないもの
 

@@ -41,6 +41,10 @@
 `<PUBLIC_URL>/quarantine?sig=<署名>` — 署名は `HMAC-SHA256(CORRECTION_SECRET, "quarantine")` の16進表現。
 セットアップ時に Claude Code が生成して利用者に渡す（ブックマーク推奨・月1回の確認を推奨）。
 Slack Webhook を設定しない構成では、隔離ボックスが SPAM 判定メールを見る唯一の手段になる。
+**修正リンク（LEAD/REVIEW への訂正）は Slack 通知にしか出ない**ため、Slack を設定しない構成では
+「本来 SPAM を LEAD として転送してしまった」等の逆方向の誤りを訂正できない（隔離ボックスは SPAM の
+救出専用）。人間の修正ループ（[安全不変条件6](../../docs/DESIGN_PRINCIPLES.md)）を LEAD/REVIEW 方向にも
+回すには、この経路では Slack 通知の設定を実質必須と考えること。
 
 ## 既知の限界（低流量・操作者1名を前提にした単純化）
 

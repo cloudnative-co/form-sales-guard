@@ -57,8 +57,15 @@ const FEW_SHOT_CACHE_TTL_MS = 10 * 60 * 1000;
 const FEW_SHOT_FETCH_TIMEOUT_MS = 3000;
 const FEW_SHOT_LIMIT = 10;
 
-const ddbClient = new DynamoDBClient({});
-const smClient = new SecretsManagerClient({});
+// AWS SDK v3 の既定 requestTimeout は無制限。Anthropic クライアントを 60s に絞っても
+// （claude.ts）、DynamoDB / Secrets 呼び出しが無制限にハングすると Lambda 120s の
+// 外側タイムアウトで死に、検知ログにも乗らない。明示タイムアウトで内側を短くする。
+const AWS_CLIENT_CONFIG = {
+  requestHandler: { requestTimeout: 10_000, connectionTimeout: 3_000 },
+  maxAttempts: 3,
+};
+const ddbClient = new DynamoDBClient(AWS_CLIENT_CONFIG);
+const smClient = new SecretsManagerClient(AWS_CLIENT_CONFIG);
 
 // Secrets Manager からの取得もモジュールレベルでキャッシュし、必須キーを fail-fast
 // 検証する（PITFALLS B-4）。シークレットを環境変数に直接置かないための構成。
@@ -284,7 +291,7 @@ const processContact = async (
   //    不要。検知は CloudWatch メトリクスフィルタ + アラーム側で行う（template.yaml）
   const channel = cfg.channels[result.label];
   const blocks = buildSlackBlocks(input, result, recordId);
-  const fallbackText = `[${result.label}] ${input.company} からの問い合わせ`;
+  const fallbackText = `[${result.label}] ${escapeSlackMrkdwn(input.company)} からの問い合わせ`;
 
   const [, slackResult] = await Promise.allSettled([
     updateClassification(cfg.TABLE_NAME, recordId, result),

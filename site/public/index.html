@@ -219,7 +219,7 @@
 </style>
 </head>
 <body>
-<script>document.documentElement.classList.add('js');</script>
+<script>if('IntersectionObserver'in window)document.documentElement.classList.add('js');</script>
 
 <div class="topbar">
   <div class="wrap">
@@ -238,8 +238,8 @@
       フォーム営業、<br><span class="bokumetsu">撲滅。</span>
     </h1>
     <p class="define"><strong>撲滅されるのは、営業文面を読むあなたの時間です。</strong><br>
-    メッセージそのものは削除されず隔離ボックスに残るので、万一の誤判定でも問い合わせが失われることはありません。</p>
-    <p style="max-width:36rem">あなたのフォームに届いた問い合わせを AI が自動で仕分けし、本物の問い合わせだけを届けます。この仕組みを自分の環境に構築できる<strong>無料公開の「作り方」</strong>を、実運用データごと公開しました。</p>
+    メッセージそのものは削除されず隔離ボックスに残るので、万一の誤判定でも隔離ボックスから確認・救出できます。</p>
+    <p style="max-width:36rem">あなたのフォームに届いた問い合わせを AI が自動で仕分けし、営業文面をより分けて、必要な問い合わせ（本物の問い合わせと、AI が判断を保留したもの）だけを届けます。この仕組みを自分の環境に構築できる<strong>無料公開の「作り方」</strong>を、実運用データごと公開しました。</p>
     <div class="cta-row">
       <a class="btn btn-shu" href="#start">自分で作る（無料レシピ）</a>
       <a class="btn btn-ink" href="https://cloudnative.co.jp/contact/">作ってほしい方はこちら</a>
@@ -311,7 +311,7 @@
           <tr><td>サーバー費用（Cloudflare）</td><td class="num">$0〜5</td><td class="num">$0〜5</td></tr>
         </table>
       </div>
-      <p>費用のほぼ全てが AI の利用料で、サーバー代は誤差です。<strong>使いすぎ防止の上限設定</strong>もセットアップ手順に含まれているので、想定外の請求が起きにくい構成です。</p>
+      <p>費用の大半は AI の利用料で、サーバー代は無料枠内ならほぼゼロです（有料プランにする場合は月 $5 程度が加わります）。<strong>使いすぎ防止の上限設定</strong>もセットアップ手順に含まれているので、想定外の請求が起きにくい構成です。</p>
       <p class="note">※ 2026年8月時点の公式料金による概算。為替と料金改定で変動します。計算式と最新の確認方法はレシピ内の費用ドキュメントに記載。</p>
     </div>
   </section>
@@ -327,8 +327,9 @@
         <li class="reveal"><b>質問に答える</b><p>「今のフォームは何で動いてる？」「通知はどこに欲しい？」「月に何件くらい？」—— 答えるだけで、費用の見積りから設置、テストまで一緒に進みます。</p></li>
       </ol>
       <div class="oneliner reveal">
-        <button class="copy-btn" id="copy" type="button" aria-label="セットアップ用の1行をコピー" aria-live="polite">コピー</button>
+        <button class="copy-btn" id="copy" type="button" aria-label="セットアップ用の1行をコピー">コピー</button>
         <code id="oneliner-text">https://github.com/cloudnative-co/form-sales-guard の SKILL.md を読んで、フォーム営業対策のセットアップを始めて</code>
+        <span id="copy-status" role="status" aria-live="polite" style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0"></span>
       </div>
       <p class="note">既存のフォームを一切変えたくない場合も大丈夫です。通知メールを転送するだけで導入できる方式（メール転送方式）もレシピに含まれています。中身をエンジニアが確認したい場合は <a href="https://github.com/cloudnative-co/form-sales-guard">GitHub リポジトリ</a>（MIT ライセンス）をどうぞ。</p>
     </div>
@@ -340,7 +341,7 @@
       <h2>よくある質問</h2>
       <div class="faq">
         <details class="reveal"><summary>本物の問い合わせが営業と誤判定されたら？</summary><div class="a">
-          <p>削除ではなく隔離なので、隔離ボックスからワンクリックで救出できます。救出すると AI がそれを学習し、同じ間違いをしにくくなります。当社の6ヶ月の運用では、救出が必要になったケースは検知されていません（0件）。</p>
+          <p>削除ではなく隔離なので、隔離ボックスの確認画面から救出できます。救出するとその例が次回以降の判定のお手本になり、同じ間違いをしにくくなります。当社の6ヶ月の運用では、救出が必要になったケースは検知されていません（0件）。</p>
         </div></details>
         <details class="reveal"><summary>営業メッセージは自動で削除されるの？</summary><div class="a">
           <p>いいえ。この仕組みには自動削除という機能が存在しません。営業と判定されたものも全て隔離ボックスに残り、いつでも一覧・確認できます。「撲滅」されるのはあなたがそれを読む時間だけです。</p>
@@ -383,22 +384,33 @@
 </footer>
 
 <script>
-  // コピー ボタン
+  // コピー ボタン。結果は独立した role="status" ノードで支援技術に通知する
+  // （ボタンの textContent 変更は aria-label 固定のため読み上げられない）
   document.getElementById('copy').addEventListener('click', async () => {
     const btn = document.getElementById('copy');
+    const status = document.getElementById('copy-status');
+    let msg;
     try {
       await navigator.clipboard.writeText(document.getElementById('oneliner-text').textContent.trim());
-      btn.textContent = 'コピーしました';
+      msg = 'コピーしました';
     } catch {
-      btn.textContent = '選択してコピーしてください';
+      msg = '選択してコピーしてください';
     }
-    setTimeout(() => { btn.textContent = 'コピー'; }, 2200);
+    btn.textContent = msg;
+    if (status) status.textContent = msg;
+    setTimeout(() => { btn.textContent = 'コピー'; if (status) status.textContent = ''; }, 2200);
   });
-  // スクロール出現（reduced-motion 時は CSS 側で無効）
-  const io = new IntersectionObserver((entries) => {
-    for (const e of entries) if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
-  }, { threshold: 0.15 });
-  document.querySelectorAll('.reveal').forEach((el) => io.observe(el));
+  // スクロール出現（reduced-motion 時は CSS 側で無効）。
+  // 初期化に失敗したら .js を外して全要素を可視に戻す（.reveal が opacity:0 のまま
+  // 残るのを防ぐ。html.js は IntersectionObserver 対応時のみ付与済み）
+  try {
+    const io = new IntersectionObserver((entries) => {
+      for (const e of entries) if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+    }, { threshold: 0.15 });
+    document.querySelectorAll('.reveal').forEach((el) => io.observe(el));
+  } catch {
+    document.documentElement.classList.remove('js');
+  }
 </script>
 </body>
 </html>

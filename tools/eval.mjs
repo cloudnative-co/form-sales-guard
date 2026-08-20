@@ -40,8 +40,22 @@ const projectDir = resolve(process.argv[2] || '.');
 const readKeyFromDevVars = (dir) => {
   try {
     const raw = readFileSync(join(dir, '.dev.vars'), 'utf8');
-    const m = raw.match(/^\s*ANTHROPIC_API_KEY\s*=\s*"?([^"\r\n]+)"?\s*$/m);
-    return m ? m[1].trim() : undefined;
+    for (const line of raw.split(/\r?\n/)) {
+      const m = line.match(/^\s*ANTHROPIC_API_KEY\s*=\s*(.*)$/);
+      if (!m) continue;
+      let v = m[1].trim();
+      // dotenv 互換: 先頭が引用符なら閉じ引用符までを値とし、以降（# コメント等）は無視。
+      // 引用符なしなら最初の # 以降をコメントとして落とす（single/double quote 両対応）
+      const q = v[0];
+      if (q === '"' || q === "'") {
+        const end = v.indexOf(q, 1);
+        v = end >= 0 ? v.slice(1, end) : v.slice(1);
+      } else {
+        v = v.split('#')[0].trim();
+      }
+      if (v) return v;
+    }
+    return undefined;
   } catch {
     return undefined;
   }
@@ -123,6 +137,9 @@ function stripUntrustedTags(s) {
 async function classify(text) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
+    // deadline を設けないとネットワーク未解決時に最初のサンプルで無期限停止し、
+    // 結果表示にも exit code にも到達しない
+    signal: AbortSignal.timeout(60_000),
     headers: {
       'content-type': 'application/json',
       'x-api-key': API_KEY,
@@ -184,7 +201,16 @@ for (const label of LABELS) {
 console.log('\n========== 検収結果 ==========');
 console.log(`正解率: ${correct}/${results.length}（${Math.round((correct / results.length) * 100)}%）`);
 console.log(`ラベル別: ${Object.entries(byLabel).map(([k, v]) => `${k} ${v}`).join(' / ')}`);
-console.log(`リード喪失方向の誤り（LEAD→SPAM）: ${leadLost}件 ${leadLost > 0 ? '← 最優先で基準を見直すこと' : '(なし・最重要指標クリア)'}`);
+// LEAD が分類エラーだと leadLost に計上されず「クリア」と誤表示されるため、
+// LEAD にエラーがある場合は「判定不能」と明示する
+const leadErrors = results.filter((r) => r.expected === 'LEAD' && r.got === 'ERROR').length;
+const leadLostMsg =
+  leadLost > 0
+    ? `${leadLost}件 ← 最優先で基準を見直すこと`
+    : leadErrors > 0
+      ? `判定不能（LEAD ${leadErrors}件が分類エラー。解消して再測定すること）`
+      : '0件（なし・最重要指標クリア）';
+console.log(`リード喪失方向の誤り（LEAD→SPAM）: ${leadLostMsg}`);
 
 const errors = results.filter((r) => r.got === 'ERROR');
 const misses = results.filter((r) => !r.ok && r.got !== 'ERROR');

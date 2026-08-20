@@ -91,6 +91,7 @@ export default {
       aiReasoning: result.reasoning,
       classificationFailed: result.failed === true,
       storageFailed: false,
+      forwardFailed: false,
       humanLabel: null, // 修正されても aiLabel は上書きしない（PITFALLS D-5）
       correctedAt: null,
     };
@@ -115,10 +116,18 @@ export default {
       h.set('X-FormGuard-Confidence', String(result.confidence));
       if (result.failed) h.set('X-FormGuard-Failed', 'true');
       if (!stored) h.set('X-FormGuard-Storage-Failed', 'true');
-      await message.forward(env.DESTINATION_ADDRESS, h);
+      try {
+        await message.forward(env.DESTINATION_ADDRESS, h);
+      } catch (error) {
+        // 転送失敗を throw すると下の notify に到達せず、非SPAMは隔離ボックスにも
+        // 出ないため完全に不可視になる。捕捉して Slack 通知に倒す（fail-open）
+        console.error(`Forward failed: ${message2(error)}`);
+        record.forwardFailed = true;
+      }
     }
 
-    // Slack 通知（LEAD/REVIEW は SLACK_WEBHOOK_URL、SPAM は SLACK_WEBHOOK_SPAM。未設定なら省略）
+    // Slack 通知（LEAD/REVIEW は SLACK_WEBHOOK_URL、SPAM は SLACK_WEBHOOK_SPAM。未設定なら省略）。
+    // 転送の成否に関わらず必ずスケジュールする
     ctx.waitUntil(notify(env, record));
   },
 
@@ -281,6 +290,7 @@ async function notify(env, record) {
     const warn = [
       record.classificationFailed ? '\n:warning: *AI分類が失敗したため人間による確認が必要です*' : '',
       record.storageFailed ? '\n:warning: *記録の保存に失敗したため、このメールは判定に関わらず転送されています*' : '',
+      record.forwardFailed ? '\n:warning: *メールの転送に失敗しました。この通知が唯一の記録です（隔離ボックスには表示されません）*' : '',
     ].join('');
     const links = await correctionLinks(env, record);
 
@@ -402,32 +412,30 @@ async function handleQuarantine(url, env) {
   if (!timingSafeEqualHex(sig, expected)) return html('リンクの署名が正しくありません。', 403);
 
   // list() は 1 回で全件を返さない（cursor 付きページング）。先頭ページだけ見ると
-  // 新着 LEAD/REVIEW に押し出された古い SPAM が永久に見えなくなるため、
-  // 50 件集まるか走査上限に達するまでページを進め、続きへのリンクも出す
+  // 新着 LEAD/REVIEW に押し出された古い SPAM が永久に見えなくなる。
+  // limit を「あと表示できる件数」に絞ることで、取得したキーを捨てずに済ませる
+  // （取得キーを捨てて cursor を次ページへ進めると、同一ページの未表示 SPAM が
+  //  二度と取得されない — これが前バージョンの取りこぼしバグだった）。
   const rows = [];
   let cursor = url.searchParams.get('cursor') || undefined;
   let listComplete = false;
-  let scanned = 0;
   let pages = 0;
-  const MAX_SCAN = 1000;
-  // pages 上限は空ページが続く異常系での無限ループ防止
-  while (!listComplete && rows.length < 50 && scanned < MAX_SCAN && pages < 20) {
+  const MAX_PAGES = 40;
+  while (!listComplete && rows.length < 50 && pages < MAX_PAGES) {
     pages++;
-    const list = await env.RECORDS.list({ prefix: 'record:', limit: 100, cursor });
+    const list = await env.RECORDS.list({ prefix: 'record:', limit: 50 - rows.length, cursor });
     for (const key of list.keys) {
-      scanned++;
       const raw = await env.RECORDS.get(key.name);
       if (!raw) continue;
       const r = JSON.parse(raw);
       if (r.aiLabel !== 'SPAM' || r.humanLabel) continue;
-      if (rows.length >= 50) continue;
       const rescueSig = await hmacHex(env.CORRECTION_SECRET, `${r.key}:LEAD`);
       rows.push(
         `<tr><td>${escapeHtml(r.createdAt.slice(0, 10))}</td><td>${escapeHtml(r.from || '')}</td><td>${escapeHtml(r.subject || '')}</td><td>${escapeHtml((r.text || '').slice(0, 100))}</td><td><a href="/correct?key=${encodeURIComponent(r.key)}&label=LEAD&sig=${rescueSig}">本物だった（救出・本文表示）</a></td></tr>`,
       );
     }
     listComplete = list.list_complete;
-    if (!listComplete) cursor = list.cursor;
+    cursor = list.cursor;
   }
 
   const moreLink = !listComplete && cursor
