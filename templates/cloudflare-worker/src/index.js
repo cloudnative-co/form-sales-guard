@@ -25,6 +25,10 @@ const ANTHROPIC_VERSION = '2023-06-01';
 // 期限の無い段が 1 つでもあると、そこが遅い故障（エラーではなくハング）をしたとき
 // waitUntil ごとキャンセルされ、fail-open（catch → REVIEW / ⚠️通知）にも検知にも
 // 乗らない不可視の消失になるため。
+// 例外: 通知に失敗したときだけ走る undelivered の再 put（+1.1s + 3s）はこの予算の外側。
+// 全段が上限に張り付くと waitUntil ごと打ち切られて印が付かないが、平常時は通らない
+// 縮退専用の経路で、失敗しても「通知も無く隔離ボックスにも出ない」という手当て前の
+// 状態に戻るだけなので best-effort とする（予算を削って分類を短くする方が害が大きい）。
 const CLASSIFY_TIMEOUT_MS = 18_000;
 const FEW_SHOT_TIMEOUT_MS = 3_000; // few-shot 取得で分類本体を止めない（PITFALLS A-7）
 const STORE_TIMEOUT_MS = 3_000; // KV 操作の期限（受付/分類結果の put・隔離ボックスの list/get。ハングを検知可能な失敗に変える）
