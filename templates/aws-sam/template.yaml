@@ -172,8 +172,10 @@ Resources:
         Target: 'es2022'
         EntryPoints:
           - src/classifier.ts
-        External:
-          - '@aws-sdk/*'
+        # 注: @aws-sdk/* を External にしない（= SDK をバンドルする）。External にすると
+        # Lambda ランタイム同梱の SDK が使われるが、その版はランタイム/リージョン/時期で
+        # 変動し、timeout の意味論（throwOnRequestTimeout・socketTimeout の挙動）が
+        # デプロイごとに変わってしまう。バンドルすれば package.json の版が決定論的に使われる
 
   # ---------------------------------------------------------------------------
   # 非同期 Lambda: few-shot 取得 → AI 分類 → 記録更新・Slack 通知（never-reject）
@@ -183,9 +185,9 @@ Resources:
     Properties:
       FunctionName: form-guard-processor
       Handler: processor.handler
-      # SQS 起動なので API GW の 29 秒制約を受けない。AI API クライアントの
-      # リトライ込み総所要（45s × 2 試行 + バックオフ ≈ 92s、claude.ts 参照）より
-      # 長く取る（タイムアウトの階層。1 試行の timeout ではなく総所要で比較する）。
+      # SQS 起動なので API GW の 29 秒制約を受けない。内側の合計（Anthropic 60s 単発
+      # （maxRetries:0、claude.ts 参照）+ few-shot 3s + AWS SDK 各呼び出しのリトライ込み
+      # 上限）より長く取る（タイムアウトの階層。1 試行の timeout ではなく総所要で比較する）。
       Timeout: 120
       CodeUri: ./
       Description: Classifies queued submissions with AI, updates record, notifies Slack
@@ -224,8 +226,10 @@ Resources:
         Target: 'es2022'
         EntryPoints:
           - src/processor.ts
-        External:
-          - '@aws-sdk/*'
+        # 注: @aws-sdk/* を External にしない（= SDK をバンドルする）。External にすると
+        # Lambda ランタイム同梱の SDK が使われるが、その版はランタイム/リージョン/時期で
+        # 変動し、timeout の意味論（throwOnRequestTimeout・socketTimeout の挙動）が
+        # デプロイごとに変わってしまう。バンドルすれば package.json の版が決定論的に使われる
 
   # ---------------------------------------------------------------------------
   # Slack Feedback Lambda: 修正ボタン → 署名検証 → IDOR 突合 → 人間ラベル記録
@@ -268,8 +272,10 @@ Resources:
         Target: 'es2022'
         EntryPoints:
           - src/feedback.ts
-        External:
-          - '@aws-sdk/*'
+        # 注: @aws-sdk/* を External にしない（= SDK をバンドルする）。External にすると
+        # Lambda ランタイム同梱の SDK が使われるが、その版はランタイム/リージョン/時期で
+        # 変動し、timeout の意味論（throwOnRequestTimeout・socketTimeout の挙動）が
+        # デプロイごとに変わってしまう。バンドルすれば package.json の版が決定論的に使われる
 
   # ---------------------------------------------------------------------------
   # 検知: fail-open は「無音で壊れる」ため、検知を必ず対にする（安全不変条件 5）

@@ -29,9 +29,11 @@ const log = {
 // DynamoDB / Secrets がハングすると Lambda 25s まで粘って Slack 側にエラー表示が出る。
 // 明示タイムアウトで内側を短くする（厳密な 3 秒 ack には非同期化が必要 — README 参照）。
 // throwOnRequestTimeout を付けないと requestTimeout 超過は警告ログのみでリクエストが
-// 継続する（= 無制限のまま）。実効上限は maxAttempts × requestTimeout + バックオフ。
+// 継続する（= 無制限のまま）。requestTimeout は headers 到達で解除されるため、body が
+// 止まる故障は socketTimeout（無通信検知）が受け持つ（SDK は template.yaml でバンドル固定）。
+// 実効上限は maxAttempts × timeout + バックオフ。
 const AWS_CLIENT_CONFIG = {
-  requestHandler: { requestTimeout: 8_000, connectionTimeout: 3_000, throwOnRequestTimeout: true },
+  requestHandler: { requestTimeout: 8_000, connectionTimeout: 3_000, socketTimeout: 8_000, throwOnRequestTimeout: true },
   maxAttempts: 2,
 };
 const ddbClient = new DynamoDBClient(AWS_CLIENT_CONFIG);

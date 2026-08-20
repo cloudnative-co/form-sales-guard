@@ -27,7 +27,7 @@ const ANTHROPIC_VERSION = '2023-06-01';
 // 乗らない不可視の消失になるため。
 const CLASSIFY_TIMEOUT_MS = 18_000;
 const FEW_SHOT_TIMEOUT_MS = 3_000; // few-shot 取得で分類本体を止めない（PITFALLS A-7）
-const STORE_TIMEOUT_MS = 3_000; // 分類結果の KV 更新（ハングも storageFailed に合流させる）
+const STORE_TIMEOUT_MS = 3_000; // KV 操作の期限（受付/分類結果の put・隔離ボックスの get。ハングを検知可能な失敗に変える）
 const NOTIFY_TIMEOUT_MS = 3_000; // Slack Webhook（通常は1秒未満で応答する）
 // KV は同一キーへの書き込みを約1回/秒に制限する。受付時 put の直後に分類が即失敗
 // （API キー欠落・即時エラー等）すると分類結果の再 put がレート制限で落ち、レコードが
@@ -139,8 +139,16 @@ async function handleSubmit(request, env, ctx) {
 
   try {
     // metadata は /quarantine が本文を get せず SPAM を絞り込むための索引（label は
-    // 分類前なので null。processSubmission で確定値に更新される）
-    await env.RECORDS.put(recordKey, JSON.stringify(record), { metadata: { label: null, corrected: false } });
+    // 分類前なので null。processSubmission で確定値に更新される）。
+    // この put は応答より前にあるため、期限を置かないと KV の遅い故障（エラーではなく
+    // ハング）で応答も分類も通知も全部止まる。期限超過後に put が遅れて着地し、分類後の
+    // 再 put を label:null で上書きする可能性は残るが（KV 非原子性の受容範囲）、その場合も
+    // 通知は送信済みで内容は人間に届いている
+    await withTimeout(
+      env.RECORDS.put(recordKey, JSON.stringify(record), { metadata: { label: null, corrected: false } }),
+      STORE_TIMEOUT_MS,
+      'Record save timeout',
+    );
   } catch (error) {
     // 記録より受付を優先して継続（縮退）。ただし修正リンクは使えない旨をログに残す
     console.error(`Record save failed: ${message(error)}`);
@@ -563,6 +571,7 @@ async function handleQuarantine(url, env) {
   let after = url.searchParams.get('after') || ''; // このキーまで処理済み（同一ページ内の再開位置）
   let ops = 0;
   let pages = 0;
+  let failed = 0; // 本文 get に失敗したキー数（poison key・KV 不調の検知）
   let done = false; // 最後まで走査し終えた（moreLink 不要）
 
   try {
@@ -582,8 +591,19 @@ async function handleQuarantine(url, env) {
         // 表示上限・操作予算に達したら現在位置で打ち切る（このページの残りは after で再開）
         if (rows.length >= 50 || ops >= OPS_BUDGET) break outer;
         ops++;
-        const raw = await env.RECORDS.get(key.name);
+        // after は get の前に進める: get 成功後に進めると、1キーの継続失敗（poison key）で
+        // 再開位置が固定化し、後続の全 SPAM に永遠に到達できなくなる。前に進めておけば
+        // 失敗したキーはこの再開チェーンではスキップされ、先頭から開き直せば再試行される
         after = key.name;
+        let raw;
+        try {
+          raw = await withTimeout(env.RECORDS.get(key.name), STORE_TIMEOUT_MS, 'Quarantine get timeout');
+        } catch (error) {
+          console.error(`Quarantine get failed (${key.name}): ${message(error)}`);
+          failed++;
+          if (failed >= 10) break outer; // KV が明らかに不調 — 部分結果 + 再開リンクで返す
+          continue;
+        }
         if (!raw) continue;
         const r = JSON.parse(raw);
         if (r.aiLabel !== 'SPAM' || r.humanLabel) continue;
@@ -613,8 +633,11 @@ async function handleQuarantine(url, env) {
     ? ''
     : `<p><a href="/quarantine?sig=${encodeURIComponent(sig)}${resumeParams}">さらに古い記録を見る →</a></p>`;
 
+  const failedNote = failed > 0
+    ? `<p>⚠️ ${failed} 件の記録が読み込めませんでした（この続きリンクでは読み飛ばします。最初のページから開き直すと再試行されます）</p>`
+    : '';
   return html(`<h1>隔離ボックス（営業と判定されたもの）</h1>
-<p>未対応の SPAM ${rows.length} 件を表示。メッセージは削除されず、ここからいつでも救出できます。月1回の確認をおすすめします。</p>
+<p>未対応の SPAM ${rows.length} 件を表示。メッセージは削除されず、ここからいつでも救出できます。月1回の確認をおすすめします。</p>${failedNote}
 <table border="1" cellpadding="6" style="border-collapse:collapse">
 <tr><th>日付</th><th>会社名</th><th>名前</th><th>本文（先頭100字）</th><th>操作</th></tr>
 ${rows.join('\n')}

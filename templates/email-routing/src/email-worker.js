@@ -35,6 +35,8 @@ const NOTIFY_TIMEOUT_MS = 10_000;
 // KV は同一キーへの書き込みを約1回/秒に制限する。保存直後の forwardFailed 再 put が
 // レート制限で落ちないよう、再 put は最小間隔を空ける
 const MIN_KEY_WRITE_INTERVAL_MS = 1_100;
+// 隔離ボックスの本文 get の期限（ハングを検知可能な失敗に変える）
+const STORE_TIMEOUT_MS = 3_000;
 const MAX_REASONING_LENGTH = 500;
 // parse を試みるメールサイズの上限。Email Routing は最大25MiBを受け入れるが、
 // PostalMime.parse の CPU 消費でハンドラが強制終了すると catch にも素通し転送にも
@@ -45,6 +47,11 @@ const MAX_REASONING_LENGTH = 500;
 // （fail-open: メールを落とさない。添付付きメールまで分類したい場合は Paid プラン
 // （CPU 上限 既定30秒）にした上でこの値を引き上げる — README 参照）
 const MAX_PARSE_SIZE = 131_072;
+// parse を試みる MIME パート数（境界行）の上限。parse の CPU はサイズではなくパート数に
+// 対し超線形に増え、実測では 40KB・1000 パートでも Free プランの CPU 10ms を超える
+// （サイズゲートだけでは防げない）。正規のフォーム通知メールは境界行が多くても 10〜20 本。
+// 過大カウント（本文中の "--" 行等）で閾値を超えても素通し転送に倒れるだけで消失はない
+const MAX_MIME_PARTS = 100;
 // 隔離時に保存する本文の上限。保存されるのはテキスト本文（無ければ HTML）の
 // 先頭1万文字のみで、添付ファイルと raw MIME は保存されない（KV 保存の制約）。
 // 救出画面・README の文言はこの制約と一致させること
@@ -92,7 +99,26 @@ export default {
     let subject = '';
     let text = '';
     try {
-      const email = await PostalMime.parse(message.raw);
+      // raw を一度だけ全量読む（postal-mime も内部で全量バッファするためメモリ増はない。
+      // raw の消費は forward() に影響しない — メール本体は Routing 側が保持している）
+      const rawBytes = new Uint8Array(await new Response(message.raw).arrayBuffer());
+      // パート数の安価な事前カウント（MAX_MIME_PARTS のコメント参照）。CPU 超過で
+      // 強制終了すると下の catch にも素通し転送にも到達しないため、parse の前に弾く。
+      // latin1 は 1 byte = 1 文字の無損失な読み方（UTF-8 として decode すると
+      // Shift_JIS 等のメールでカウント前にバイト情報が壊れる）
+      const view = new TextDecoder('latin1').decode(rawBytes);
+      let boundaryLines = 0;
+      for (let i = view.indexOf('\n--'); i !== -1; i = view.indexOf('\n--', i + 3)) boundaryLines++;
+      if (boundaryLines > MAX_MIME_PARTS) {
+        console.warn(`Email has too many MIME parts (${boundaryLines} boundary lines), forwarding as-is`);
+        const h = new Headers();
+        h.set('X-FormGuard-Label', 'SKIPPED-PARTS');
+        await message.forward(env.DESTINATION_ADDRESS, h);
+        return;
+      }
+      // parse には文字列ではなく bytes を渡す（string 入力は postal-mime が UTF-8 で
+      // 再エンコードするため、Shift_JIS 等の 8bit メールの本文が壊れる）
+      const email = await PostalMime.parse(rawBytes);
       subject = (email.subject || '').slice(0, 300);
       text = (email.text || email.html || '').slice(0, MAX_STORED_TEXT);
     } catch (error) {
@@ -503,6 +529,7 @@ async function handleQuarantine(url, env) {
   let after = url.searchParams.get('after') || ''; // このキーまで処理済み（同一ページ内の再開位置）
   let ops = 0;
   let pages = 0;
+  let failed = 0; // 本文 get に失敗したキー数（poison key・KV 不調の検知）
   let done = false; // 最後まで走査し終えた（moreLink 不要）
 
   try {
@@ -522,8 +549,19 @@ async function handleQuarantine(url, env) {
         // 表示上限・操作予算に達したら現在位置で打ち切る（このページの残りは after で再開）
         if (rows.length >= 50 || ops >= OPS_BUDGET) break outer;
         ops++;
-        const raw = await env.RECORDS.get(key.name);
+        // after は get の前に進める: get 成功後に進めると、1キーの継続失敗（poison key）で
+        // 再開位置が固定化し、後続の全 SPAM に永遠に到達できなくなる。前に進めておけば
+        // 失敗したキーはこの再開チェーンではスキップされ、先頭から開き直せば再試行される
         after = key.name;
+        let raw;
+        try {
+          raw = await withTimeout(env.RECORDS.get(key.name), STORE_TIMEOUT_MS, 'Quarantine get timeout');
+        } catch (error) {
+          console.error(`Quarantine get failed (${key.name}): ${message2(error)}`);
+          failed++;
+          if (failed >= 10) break outer; // KV が明らかに不調 — 部分結果 + 再開リンクで返す
+          continue;
+        }
         if (!raw) continue;
         const r = JSON.parse(raw);
         if (r.aiLabel !== 'SPAM' || r.humanLabel) continue;
@@ -552,8 +590,11 @@ async function handleQuarantine(url, env) {
     ? ''
     : `<p><a href="/quarantine?sig=${encodeURIComponent(sig)}${resumeParams}">さらに古い記録を見る →</a></p>`;
 
+  const failedNote = failed > 0
+    ? `<p>⚠️ ${failed} 件の記録が読み込めませんでした（この続きリンクでは読み飛ばします。最初のページから開き直すと再試行されます）</p>`
+    : '';
   return html(`<h1>隔離ボックス（営業と判定されたメール）</h1>
-<p>未対応の SPAM ${rows.length} 件を表示。メールは削除されず、ここからいつでも本文（先頭1万字・添付は保存されません）の確認と救出ができます。月1回の確認をおすすめします。</p>
+<p>未対応の SPAM ${rows.length} 件を表示。メールは削除されず、ここからいつでも本文（先頭1万字・添付は保存されません）の確認と救出ができます。月1回の確認をおすすめします。</p>${failedNote}
 <table border="1" cellpadding="6" style="border-collapse:collapse">
 <tr><th>日付</th><th>差出人</th><th>件名</th><th>本文（先頭100字）</th><th>操作</th></tr>
 ${rows.join('\n')}
@@ -594,6 +635,14 @@ function message2(error) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Promise に期限を付ける。期限側が先に落ちても元の Promise は継続する（安全側） */
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(label)), ms)),
+  ]);
 }
 
 function html(body, status = 200) {

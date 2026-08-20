@@ -69,10 +69,15 @@ if (!API_KEY) {
   2. 実行前に環境変数として export しておく`);
   process.exit(2);
 }
-const criteriaPath = join(projectDir, 'src', 'criteria.js');
+// 経路A/B は src/criteria.js、経路C は検収用アダプタ src/criteria.mjs を読む
+// （.mjs は package.json の type や Node の版に関係なく常に ESM として読まれるため、
+// "type":"module" を持たない経路C プロジェクトでも確実に import できる）
+const criteriaPath = ['criteria.js', 'criteria.mjs']
+  .map((f) => join(projectDir, 'src', f))
+  .find((p) => existsSync(p));
 const samplesDir = join(projectDir, 'samples');
-if (!existsSync(criteriaPath)) {
-  console.error(`判定基準が見つかりません: ${criteriaPath}\n先に SKILL.md Step 2 で criteria.js を生成してください。`);
+if (!criteriaPath) {
+  console.error(`判定基準が見つかりません: ${join(projectDir, 'src')}/criteria.js（経路C は criteria.mjs）\n先に SKILL.md Step 2 で判定基準を生成してください。`);
   process.exit(1);
 }
 if (!existsSync(samplesDir)) {
@@ -102,6 +107,18 @@ if (missingCriteria.length > 0) {
 criteria.js は次のどちらかの形式で export してください:
   1. 経路A/B の形式: export const COMPANY_NAME / COMPANY_BLOCK / LABEL_BLOCK
   2. 経路C の形式:   export const CRITERIA = { companyName, companyBlock, labelBlock }`);
+  process.exit(1);
+}
+// テンプレート・雛形のままの基準を検収に通さない。プレースホルダーは「非空の文字列」
+// なので上の検証を素通りし、基準を一切書いていなくても分類が一般常識で当たってしまい
+// 「全件正解 → デプロイに進んでください」という偽の合格が出る
+const SENTINELS = ['YOUR_COMPANY_NAME', 'ここに生成する', '架空の例'];
+const foundSentinels = SENTINELS.filter((s) =>
+  [criteria.COMPANY_NAME, criteria.COMPANY_BLOCK, criteria.LABEL_BLOCK].some((v) => v.includes(s)),
+);
+if (foundSentinels.length > 0) {
+  console.error(`判定基準がテンプレート（雛形）のままです（「${foundSentinels.join('」「')}」を検出): ${criteriaPath}
+SKILL.md Step 2 で、あなたに実際に届いたメールから基準を生成してから検収してください。`);
   process.exit(1);
 }
 const { COMPANY_NAME, COMPANY_BLOCK, LABEL_BLOCK } = criteria;

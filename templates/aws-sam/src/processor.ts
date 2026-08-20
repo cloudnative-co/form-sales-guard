@@ -52,10 +52,12 @@ const FEW_SHOT_LIMIT = 10;
 // （claude.ts）、DynamoDB / Secrets 呼び出しが無制限にハングすると Lambda 120s の
 // 外側タイムアウトで死に、検知ログにも乗らない。明示タイムアウトで内側を短くする。
 // throwOnRequestTimeout を付けないと requestTimeout 超過は警告ログのみでリクエストが
-// 継続する（= タイムアウトを設定したつもりで無制限）。TimeoutError はリトライ対象の
-// ため、実効上限は maxAttempts × requestTimeout + バックオフ（≈ 3 × 10s）。
+// 継続する（= タイムアウトを設定したつもりで無制限）。さらに requestTimeout は headers
+// 到達で解除されるため、body が止まる故障は socketTimeout（無通信検知）が受け持つ
+// （SDK の版は template.yaml でバンドルして固定 — ^3.910.0 未満は意味論が異なる）。
+// いずれもリトライ対象のため、実効上限は maxAttempts × timeout + バックオフ（≈ 3 × 10s）。
 const AWS_CLIENT_CONFIG = {
-  requestHandler: { requestTimeout: 10_000, connectionTimeout: 3_000, throwOnRequestTimeout: true },
+  requestHandler: { requestTimeout: 10_000, connectionTimeout: 3_000, socketTimeout: 10_000, throwOnRequestTimeout: true },
   maxAttempts: 3,
 };
 const ddbClient = new DynamoDBClient(AWS_CLIENT_CONFIG);

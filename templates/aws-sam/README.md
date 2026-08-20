@@ -56,7 +56,8 @@ Slack 修正ボタン POST /slack/actions
    [prompts/classifier-skeleton.md](../../prompts/classifier-skeleton.md) の手順で
    ブロック①（会社知識）②（LEAD/SPAM 基準）を生成して埋める。`criteria.ts` は
    **`.gitignore` 済み**（機微な判定基準を tracked な `processor.ts` に書かせないための分離。
-   `processor.ts` は `import { CRITERIA } from './criteria.js'` で読む）。
+   `processor.ts` は `import { CRITERIA } from './criteria.ts'` で読む — 拡張子 `.ts` は
+   検収用の一時 JS が残留してもバンドルに紛れ込まないための意図的な指定）。
    生成した基準はあなたのものであり、このリポジトリに投稿しない
 2. **Secrets Manager にシークレットを作成**: JSON で `ANTHROPIC_API_KEY` / `SLACK_BOT_TOKEN` /
    `SLACK_SIGNING_SECRET` を格納し、ARN を `SecretsArn` パラメータに渡す
@@ -83,7 +84,7 @@ SPAM も削除されず (1) DynamoDB の全レコード、(2) SPAM 専用 Slack 
 | A-1 モデル引退のサイレント劣化 | `claude.ts` の `MODEL_ID` 1箇所集約 + `template.yaml` の分類失敗アラーム |
 | A-2/A-3 thinking ブロックと max_tokens | `claude.ts` の text ブロック探索・`max_tokens: 4096` |
 | A-4 LLM 出力の防御的パース | `claude.ts` の型ガード（label enum / confidence 丸め / reasoning フォールバック+500字） |
-| A-5 SDK タイムアウトの階層 | `claude.ts` の `timeout: 60_000, maxRetries: 0`（再試行を断ち単一 60s < Lambda 120s）+ `classifier/processor/feedback.ts` の AWS SDK 各 client に明示 requestTimeout と `throwOnRequestTimeout: true`（このフラグが無いと超過は警告ログのみで実質無制限） |
+| A-5 SDK タイムアウトの階層 | `claude.ts` の `timeout: 60_000, maxRetries: 0`（再試行を断ち単一 60s < Lambda 120s）+ `classifier/processor/feedback.ts` の AWS SDK 各 client に requestTimeout / `throwOnRequestTimeout: true`（無いと超過は警告のみ）/ `socketTimeout`（body 局面の無通信検知）。SDK は `template.yaml` でバンドルし版を固定 |
 | A-6/A-7 few-shot のタグと分離 | `claude.ts` の untrusted タグ / `processor.ts` の 3s タイムアウト+キャッシュ |
 | B-1 fire-and-forget 禁止 | SQS 分離 + `Promise.allSettled` 並列（`processor.ts`） |
 | B-2 同期 25s < API GW 29s | `template.yaml` の Globals コメント |
@@ -117,7 +118,7 @@ DynamoDB に単純化しているが、以下のインターフェースで差�
 - **修正ボタンの処理が同期的**: Slack の 3 秒 ack 要件に対し、Secrets 取得〜GSI Query〜UpdateItem〜chat.update を完了してから 200 を返すため、遅延時は Slack 側にエラー表示が出ることがある（**DB への記録は成功していることがある**。メッセージのボタンが残っていれば再度押してよい — 記録済みなら no-op になる）。また GSI は結果整合のため、通知の投稿直後にボタンを押すと逆引きに失敗して無視されることがある（数秒待って押し直せばよい）。厳密にするなら署名検証後に即 ack して処理を非同期化する
 - **DynamoDB 保存と SQS 送信が非トランザクション**: PutItem 成功後に SendMessage が失敗すると `received` のまま処理されないレコードが残る（クライアントには 500 が返るため利用者は再送できる）。厳密にするなら outbox パターンか未投入レコードの定期照合を入れる
 - **Processor の SQS 実行ロールは全キュー対象**: DynamoDB/Secrets の IAM は最小化したが、SAM が SQS イベントソース用に付与する実行ロール（`AWSLambdaSQSQueueExecutionRole`）は `ReceiveMessage`/`DeleteMessage` の Resource が `*`（全キュー）になる。厳密には Processor に custom role を指定し、対象 `ProcessingQueue` の ARN だけに限定する
-- **タイムアウトは各 SDK 呼び出し単位で、end-to-end のハード上限ではない**: Anthropic は `maxRetries:0`（60s 単発）、AWS SDK 各 client は明示 requestTimeout + `throwOnRequestTimeout: true`（フラグが無いと超過は警告ログのみでリクエストが継続する = 実質無制限）。TimeoutError はリトライ対象のため各呼び出しの実効上限は「maxAttempts × requestTimeout + バックオフ」。それでも `processor` は「Anthropic 60s + few-shot + DynamoDB/Slack（各リトライ込み）」の積み上げが理論上 Lambda 120s を超えうる。厳密にするなら各 await を Lambda 残時間（`context.getRemainingTimeInMillis()`）ベースの deadline で締める
+- **タイムアウトは各 SDK 呼び出し単位で、end-to-end のハード上限ではない**: Anthropic は `maxRetries:0`（60s 単発）、AWS SDK 各 client は明示 requestTimeout + `throwOnRequestTimeout: true` + `socketTimeout`（requestTimeout は headers 到達で解除されるため、body が止まる故障は socketTimeout の無通信検知が受け持つ。SDK はバンドルして版を固定 — ランタイム同梱 SDK は版が変動し timeout の意味論ごと変わる）。各呼び出しの実効上限は「maxAttempts × timeout + バックオフ」。残る穴は2つ: (1) データが細く流れ続ける trickle 応答は socketTimeout をすり抜ける — `processor` は Lambda 120s → SQS 再配信 → DLQ アラームで検知され、`classifier` は 25s で死に送信者にエラーが見える（無音の消失にはならない。心配なら classifier の Lambda Errors アラームを追加する） (2) 複数 await の積み上げが理論上 Lambda 上限を超えうる — 厳密にするなら各 await を Lambda 残時間（`context.getRemainingTimeInMillis()`）ベースの deadline で締める
 
 ## 変えてはいけないもの
 

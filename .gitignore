@@ -6,4 +6,5 @@ node_modules/
 
 # 実際の営業文面・判定基準（各導入者のローカル生成物）は絶対にコミットしない
 criteria.js
+criteria.mjs
 samples/

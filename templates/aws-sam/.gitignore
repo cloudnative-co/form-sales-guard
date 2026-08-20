@@ -9,7 +9,9 @@ samconfig.toml
 # （criteria.example.ts はテンプレートに含めるが、生成される criteria.ts/.js は除外）
 criteria.js
 criteria.ts
+criteria.mjs
 src/criteria.js
 src/criteria.ts
+src/criteria.mjs
 # 検収用の実例メール（tools/eval.mjs 用）。個人情報を含むため絶対にコミットしない
 samples/
