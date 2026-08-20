@@ -25,8 +25,10 @@ const ANTHROPIC_VERSION = '2023-06-01';
 // 期限の無い段が 1 つでもあると、そこが遅い故障（エラーではなくハング）をしたとき
 // waitUntil ごとキャンセルされ、fail-open（catch → REVIEW / ⚠️通知）にも検知にも
 // 乗らない不可視の消失になるため。
-// 予算の外側で走る段は 1 つも無い（分類後の同一キー書き込みは 1 回だけ。理由は
-// processSubmission のコメント参照）。段を増やすときは、この積算が 30 秒を超えないこと。
+// 予算の外側にあるのは、分類後 put が失敗したときだけ走る storage-failure アラート(+3s)
+// 1 つだけ。これは KV に書かないので、waitUntil に打ち切られても失うのはアラートだけで
+// 記録は壊れない（同じ「尾部の best-effort」でも、KV に書く段は印を巻き戻しうるので置かない
+// ── 理由は processSubmission のコメント参照）。段を増やすときはこの積算を超えないこと。
 const CLASSIFY_TIMEOUT_MS = 18_000;
 const FEW_SHOT_TIMEOUT_MS = 3_000; // few-shot 取得で分類本体を止めない（PITFALLS A-7）
 const STORE_TIMEOUT_MS = 3_000; // KV 操作の期限（受付/分類結果の put・隔離ボックスの list/get。ハングを検知可能な失敗に変える）
@@ -241,6 +243,40 @@ async function processSubmission(env, record, acceptedAt) {
     // 隔離ボックスの「未分類」が回収する（UNCLASSIFIED_GRACE_MS 経過後）。
     // 受付時 put も失敗していた場合は storageFailed 経由で通知に倒れている
     console.error(`Record update failed: ${message(error)}`);
+    // 通知は既に出し終えているので、この失敗を載せる場所がもう無い。人間に push される
+    // 面が無い記録（SPAM = 主チャンネルに出していない / 通知そのものが失敗した）だけ、
+    // 「保存に失敗した」ことを別便で知らせる（縮退には検知を対にする＝原則5）。
+    // KV に書かないので、削除した undelivered 再 put と違い競合も巻き戻しも作らない
+    if (record.aiLabel === 'SPAM' || !notified) {
+      await alertStorageFailure(env, record);
+    }
+  }
+}
+
+/**
+ * 分類後の保存が落ちたことだけを主チャンネルに知らせる（KV 書き込みを伴わない軽量アラート）。
+ * waitUntil の打ち切りに巻き込まれると失われるが、失うのはアラートだけで記録は壊れない。
+ */
+async function alertStorageFailure(env, record) {
+  if (!env.SLACK_WEBHOOK_URL) return;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), NOTIFY_TIMEOUT_MS);
+  try {
+    const res = await fetch(env.SLACK_WEBHOOK_URL, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        text: `:warning: *[${record.aiLabel}]* 分類結果の保存に失敗しました（${escapeSlackText(record.company || '(会社名なし)')} — ${escapeSlackText(record.name)}）。この問い合わせは隔離ボックスに「未分類」として残ります。`,
+        unfurl_links: false,
+        unfurl_media: false,
+      }),
+    });
+    if (!res.ok) throw new Error(`Webhook HTTP ${res.status}`);
+  } catch (error) {
+    console.error(`Storage failure alert failed: ${message(error)}`);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
