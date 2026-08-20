@@ -161,6 +161,7 @@ export default {
       classificationFailed: result.failed === true,
       storageFailed: false,
       forwardFailed: false,
+      notifyFailed: false,
       humanLabel: null, // 修正されても aiLabel は上書きしない（PITFALLS D-5）
       correctedAt: null,
     };
@@ -219,6 +220,10 @@ export default {
     // 転送にも通知にも失敗した非SPAM は、KV には残るのに人間の目に触れる面が無くなる
     // （隔離ボックスは SPAM 専用）。metadata に undelivered の印を付けて隔離ボックスに出す
     if (stored && !isSpam && record.forwardFailed && !notified) {
+      // metadata の undelivered と本文の notifyFailed は必ず同時に書くこと。
+      // 隔離ボックスは metadata で絞り込み・本文で確定するため、片方だけだと
+      // 「get はされるのに行にならない」＝不可視のまま ops だけ食う記録になる
+      record.notifyFailed = true;
       try {
         const sinceStore = Date.now() - storedAt;
         if (sinceStore < MIN_KEY_WRITE_INTERVAL_MS) await sleep(MIN_KEY_WRITE_INTERVAL_MS - sinceStore);

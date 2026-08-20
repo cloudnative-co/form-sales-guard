@@ -227,6 +227,9 @@ async function processSubmission(env, record, acceptedAt) {
   // metadata に undelivered の印を付けて隔離ボックスに出す。通知に成功した平常時は
   // ここを通らないため、書き込み回数は増えない
   if (!notified) {
+    // metadata の undelivered と本文の notifyFailed は必ず同時に書くこと。
+    // 隔離ボックスは metadata で絞り込み・本文で確定するため、片方だけだと
+    // 「get はされるのに行にならない」＝不可視のまま ops だけ食う記録になる
     record.notifyFailed = true;
     try {
       const sinceUpdate = Date.now() - updatedAt;
