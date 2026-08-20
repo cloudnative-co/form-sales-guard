@@ -108,7 +108,9 @@ description: お問い合わせフォームに届く営業スパム（フォー�
    ```
    npx wrangler kv namespace create RECORDS   # 記録の保存場所を作成 → wrangler.toml に反映
    npx wrangler secret put ANTHROPIC_API_KEY
-   npx wrangler secret put SLACK_WEBHOOK_URL   # 通知先に応じて
+   npx wrangler secret put SLACK_WEBHOOK_URL   # 経路Aでは必須（未設定だと /submit が 500 を返し受付が止まる）
+   # 通知先を Slack 以外（メール送信 API・Teams 等）にする場合は、notify() と一緒に
+   # index.js の missingNotifyConfig() も差し替えること（「届ける先がある」の定義が変わる）
    npx wrangler secret put CORRECTION_SECRET   # ランダム生成して設定（openssl rand -hex 32 等）
    npx wrangler deploy
    ```
@@ -131,11 +133,16 @@ description: お問い合わせフォームに届く営業スパム（フォー�
 2. **営業らしいテスト送信**: Step 2 で貼られたものに似た営業文（あなたが架空に作成）で送信 → SPAM として通知されず、隔離ボックス（`/quarantine` の署名付きリンク）に入ること
 3. **修正フローの確認**: 通知内の修正リンクを開く → 確認画面の実行ボタンを押す → 記録が更新され、次回分類の few-shot に反映されること（リンクを開いただけでは修正されないのが正しい挙動。GET は副作用なし）
 4. **fail-open の確認**: 一時的に不正なモデル名に変えて送信 → REVIEW（⚠️付き）として通知されること。**確認後に必ず戻す**
-5. **テストデータの掃除（スキップ禁止）**: 検証で作った `record:` / `correction:` キーを KV から削除する。特に手順3の修正テストは「営業文面 → LEAD」のような**誤った few-shot 例**を残し、以後の分類を汚染する（当社の実機検証で確認済み）。**キー名だけではテストデータと本物（Step 4-5 で投入した初期 few-shot・運用開始後の本番問い合わせ）を区別できない**ため、目視で選んで消すのではなく、検証の前後スナップショットの差分だけを消す:
+5. **取り残しが見えることの確認（経路A）**: 分類結果を書き込めなかった状態を手で再現し、隔離ボックスに「未分類」として現れることを確認する。**本文の `aiLabel` も null に戻す必要がある**（metadata だけ戻しても表示条件を満たさない）。手順1の記録を `wrangler kv key get` で取り出し、`aiLabel` / `aiConfidence` / `aiReasoning` を null にした JSON を `samples/_stranded.json` に書いてから:
+   ```
+   npx wrangler kv key put --binding RECORDS --remote "<キー>" --path samples/_stranded.json --metadata '{"label":null,"corrected":false}'
+   ```
+   キーの逆順タイムスタンプが10分より古いこと（手順1から10分以上経っていること）が条件。開いて「未分類」の行が出れば合格。ここが出ないと、分類結果を書き込めなかった問い合わせが誰にも見えなくなる（安全不変条件2）。確認後は救出リンクで片付け、`samples/_stranded.json` を削除する
+6. **テストデータの掃除（スキップ禁止）**: 検証で作った `record:` / `correction:` キーを KV から削除する。特に手順3の修正テストは「営業文面 → LEAD」のような**誤った few-shot 例**を残し、以後の分類を汚染する（当社の実機検証で確認済み）。**キー名だけではテストデータと本物（Step 4-5 で投入した初期 few-shot・運用開始後の本番問い合わせ）を区別できない**ため、目視で選んで消すのではなく、検証の前後スナップショットの差分だけを消す:
    ```
    # 検証を始める前に
    npx wrangler kv key list --binding RECORDS --remote > /tmp/kv_before.json
-   # （Step 5-1〜5-4 の検証を実施）
+   # （Step 5-1〜5-5 の検証を実施）
    # 検証が終わったら
    npx wrangler kv key list --binding RECORDS --remote > /tmp/kv_after.json
    # before に無く after にあるキー = テストで増えたキー。これだけを1件ずつ削除

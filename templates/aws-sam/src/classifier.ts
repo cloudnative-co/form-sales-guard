@@ -65,7 +65,8 @@ export interface ProcessorMessage {
 // 明示タイムアウトで内側を短くする。throwOnRequestTimeout を付けないと requestTimeout
 // 超過は警告ログのみでリクエストが継続する（= 無制限のまま）。さらに requestTimeout は
 // headers 到達で解除されるため、body が止まる故障は socketTimeout（無通信検知）が受け持つ
-// （SDK の版は template.yaml でバンドルして固定 — ^3.910.0 未満は意味論が異なる）。
+// （SDK は template.yaml でバンドルし、同梱 SDK ではなく ^3.910.0 以上が使われるように
+// している — 3.910.0 未満は throwOnRequestTimeout を持たず意味論が異なる）。
 // いずれもリトライ対象のため、実効上限は maxAttempts × timeout + バックオフ（≈ 2 × 8s < 25s）。
 const AWS_CLIENT_CONFIG = {
   requestHandler: { requestTimeout: 8_000, connectionTimeout: 3_000, socketTimeout: 8_000, throwOnRequestTimeout: true },
@@ -142,7 +143,19 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       return { statusCode: 400, headers, body: JSON.stringify({ error: 'Missing request body' }) };
     }
 
-    const { input, honeypot, timestamp } = parseBody(event.body);
+    // クライアント起因の不正 body は 400 で返し 'Handler error' を出さない。
+    // 'Handler error' は受付そのものの故障（DynamoDB PutItem / SQS SendMessage）専用の
+    // 契約文字列（template.yaml の ClassifierErrorMetricFilter）で、無認証の /submit に
+    // 日常的に飛んでくる探索 POST でアラームを焚くと、その最中に起きた本物の故障が
+    // 状態遷移なしで埋もれる（安全不変条件5の検知が外から無効化される）
+    let parsed: ReturnType<typeof parseBody>;
+    try {
+      parsed = parseBody(event.body);
+    } catch (error) {
+      log.warn('Invalid request body', { error: error instanceof Error ? error.message : String(error) });
+      return { statusCode: 400, headers, body: JSON.stringify({ error: 'Invalid request body' }) };
+    }
+    const { input, honeypot, timestamp } = parsed;
 
     // --- ボット対策は AI 分類の前段に多層で敷く（AI は「人間が送る営業」用の最後の層）---
 

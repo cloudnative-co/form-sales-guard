@@ -23,7 +23,7 @@ SPAM         → 通知なし・KV に隔離（/quarantine で一覧・救出）
 
 1. `src/criteria.example.js` を参考に `src/criteria.js` を生成（対話で判定基準を作る）
 2. `npx wrangler kv namespace create RECORDS` → 出力の id を `wrangler.toml` へ
-3. シークレット3つを設定: `ANTHROPIC_API_KEY` / `CORRECTION_SECRET` / `SLACK_WEBHOOK_URL`
+3. シークレット3つを設定: `ANTHROPIC_API_KEY` / `CORRECTION_SECRET` / `SLACK_WEBHOOK_URL`（**`SLACK_WEBHOOK_URL` は必須**。未設定だと `/submit` が 500 を返して受付を止める — 下の「既知の限界」参照）
 4. `npx wrangler deploy` → 表示された URL を `wrangler.toml` の `PUBLIC_URL` に入れて再デプロイ
 5. `/test-form` でテスト送信 → 通知・隔離・修正リンクを確認
 6. 本番フォームの送信先を `/submit` に向け、`ALLOWED_ORIGIN` を本番オリジンに設定、`TEST_FORM = "false"` に
@@ -40,6 +40,9 @@ SPAM         → 通知なし・KV に隔離（/quarantine で一覧・救出）
 - **モデル変更**: `wrangler.toml` の `MODEL` のみ（コードは触らない）
 
 ## 既知の限界（低流量・操作者1名を前提にした単純化）
+
+- **通知先が未設定だとフォームが止まる**: `SLACK_WEBHOOK_URL` が無いまま受け付けると、LEAD/REVIEW は Slack にも隔離ボックス（SPAM 専用）にも出ず、人間から完全に見えなくなる。そのため `/submit` は通知先の有無を受付の前提条件として扱い、未設定なら 500 を返す（`missingNotifyConfig()`）。運用中に Webhook のシークレットを消すとその瞬間にフォームが止まるが、「受け付けたのに誰にも届かない」より「送信者にエラーが見えて別の連絡手段に切り替えられる」ほうを選んでいる（安全不変条件1）。`notify()` を別チャネルに差し替えるときは `missingNotifyConfig()` も合わせて直すこと
+- **隔離ボックスには「未分類」の行が出ることがある**: KV は同一キーへの並行書き込みが last-write-wins で順序保証が無く、受付時の保存が期限超過の後から着地する・`waitUntil` が 30 秒で打ち切られる・分類後の保存と通知が揃って失敗する、のいずれでも分類ラベルが入らないまま残ることがある。この取り残しは隔離ボックスに「未分類」として表示され、そこから内容を確認して救出できる（原因は塞げないが、見えなくなる経路は塞いである）
 
 - **修正処理は原子的でない**: Workers KV は read-modify-write のトランザクションを持たないため、複数人がほぼ同時に同じ通知の修正リンクを実行すると、矛盾した few-shot 例（`correction:` キー）が両方残りうる。起きたら隔離ボックス・`wrangler kv key list` で該当 `correction:` キーを削除すれば直る。操作者が実質1名の運用では問題にならない
 - **修正・隔離リンクに有効期限はない**: リンクは Slack 内部にのみ流れる前提。万一 URL が外部に漏れた場合は `CORRECTION_SECRET` を再生成して再デプロイすれば全リンクが失効する

@@ -16,6 +16,11 @@
  *   6. 人間の修正 UI ..... 署名付き救出リンク（GET=確認画面 / POST=実行）。AI の元判定は上書きしない
  *   7. 費用上限 .......... 運用設定で担保（SKILL.md Step 4）
  *
+ * 配送に失敗したときの倒し方:
+ *   - 転送先が未設定（届ける手段が構造的に無い）→ setReject() で送信元に恒久エラーを返す
+ *   - 転送・保存・通知が同時に失敗（一過性障害）→ throw して Cloudflare の再送に委ねる
+ *     （恒久エラーを返すとフォームサービス側でアドレスが抑止され、以後の全通知を失う）
+ *
  * 制約（Cloudflare の仕様）:
  *   - forward() の宛先は Email Routing で検証済みのアドレスのみ
  *   - forward() では件名を書き換えられない（追加できるのは X- ヘッダのみ）
@@ -35,8 +40,12 @@ const NOTIFY_TIMEOUT_MS = 10_000;
 // KV は同一キーへの書き込みを約1回/秒に制限する。保存直後の forwardFailed 再 put が
 // レート制限で落ちないよう、再 put は最小間隔を空ける
 const MIN_KEY_WRITE_INTERVAL_MS = 1_100;
-// 隔離ボックスの本文 get の期限（ハングを検知可能な失敗に変える）
+// 隔離ボックスの list/get の期限（ハングを検知可能な失敗に変える）
 const STORE_TIMEOUT_MS = 3_000;
+// 隔離ボックス1ページの実時間の上限。上の期限は KV 1操作ずつにしか効かず、「失敗せず
+// 遅いだけ」の KV では直列 get が最大 900 件近く積み上がって数十分待たされるため、
+// ページ全体にも上限を置く（打ち切り先は操作予算超過と同じ「部分結果 + 再開リンク」）
+const QUARANTINE_PAGE_DEADLINE_MS = 10_000;
 const MAX_REASONING_LENGTH = 500;
 // parse を試みるメールサイズの上限。Email Routing は最大25MiBを受け入れるが、
 // PostalMime.parse の CPU 消費でハンドラが強制終了すると catch にも素通し転送にも
@@ -73,15 +82,28 @@ export default {
     if (missing.length > 0) {
       // 設定不備でもメールは失わない: 宛先が分かるなら素通しで転送を試みる
       console.error(`Missing required configuration: ${missing.join(', ')}`);
-      if (env.DESTINATION_ADDRESS) await message.forward(env.DESTINATION_ADDRESS);
+      if (env.DESTINATION_ADDRESS) {
+        try {
+          await message.forward(env.DESTINATION_ADDRESS);
+          return;
+        } catch (error) {
+          // 未検証アドレス（雛形の you@example.com のまま等）だと forward は throw する
+          console.error(`Forward failed (degraded config): ${message2(error)}`);
+        }
+      }
+      // 転送先が無い／転送できない = 届ける手段が無い。ここで何もせず正常終了すると
+      // Cloudflare はメールを黙って破棄する（email ハンドラが結果を決められるのは
+      // forward() / reply() / setReject() の3つだけで、どれも呼ばなければ drop）。
+      // 黙って消さず、送信元に恒久 SMTP エラーを返して失敗を可視化する。
+      // この分岐は下の notify() に到達しないため、設定不備自体も個別に通知する
+      await alertOperator(env, '設定不備', `不足している設定: ${missing.join(', ')}（送信元に恒久エラーを返しています）`, message.from);
+      message.setReject('form-guard: mail relay is misconfigured');
       return;
     }
 
     // フォーム通知以外のメールは分類せず素通し（FORM_SENDER 設定時のみ判定）
     if (env.FORM_SENDER && !message.from.toLowerCase().includes(env.FORM_SENDER.toLowerCase())) {
-      const h = new Headers();
-      h.set('X-FormGuard-Label', 'SKIPPED');
-      await message.forward(env.DESTINATION_ADDRESS, h);
+      await forwardOrAlert(message, env, 'SKIPPED');
       return;
     }
 
@@ -89,9 +111,7 @@ export default {
     // 強制終了し、catch にも転送にも到達しない事故を防ぐ）
     if (typeof message.rawSize === 'number' && message.rawSize > MAX_PARSE_SIZE) {
       console.warn(`Email too large to classify (${message.rawSize} bytes), forwarding as-is`);
-      const h = new Headers();
-      h.set('X-FormGuard-Label', 'SKIPPED-LARGE');
-      await message.forward(env.DESTINATION_ADDRESS, h);
+      await forwardOrAlert(message, env, 'SKIPPED-LARGE');
       return;
     }
 
@@ -111,9 +131,7 @@ export default {
       for (let i = view.indexOf('\n--'); i !== -1; i = view.indexOf('\n--', i + 3)) boundaryLines++;
       if (boundaryLines > MAX_MIME_PARTS) {
         console.warn(`Email has too many MIME parts (${boundaryLines} boundary lines), forwarding as-is`);
-        const h = new Headers();
-        h.set('X-FormGuard-Label', 'SKIPPED-PARTS');
-        await message.forward(env.DESTINATION_ADDRESS, h);
+        await forwardOrAlert(message, env, 'SKIPPED-PARTS');
         return;
       }
       // parse には文字列ではなく bytes を渡す（string 入力は postal-mime が UTF-8 で
@@ -123,7 +141,7 @@ export default {
       text = (email.text || email.html || '').slice(0, MAX_STORED_TEXT);
     } catch (error) {
       console.error(`Email parse failed: ${message2(error)}`);
-      await message.forward(env.DESTINATION_ADDRESS);
+      await forwardOrAlert(message, env, 'PARSE-FAILED');
       return;
     }
 
@@ -198,10 +216,29 @@ export default {
     // ctx.waitUntil ではなく await: email ハンドラには送信者への同期応答が無いため待てる
     const notified = await notify(env, record);
 
+    // 転送にも通知にも失敗した非SPAM は、KV には残るのに人間の目に触れる面が無くなる
+    // （隔離ボックスは SPAM 専用）。metadata に undelivered の印を付けて隔離ボックスに出す
+    if (stored && !isSpam && record.forwardFailed && !notified) {
+      try {
+        const sinceStore = Date.now() - storedAt;
+        if (sinceStore < MIN_KEY_WRITE_INTERVAL_MS) await sleep(MIN_KEY_WRITE_INTERVAL_MS - sinceStore);
+        await env.RECORDS.put(recordKey, JSON.stringify(record), {
+          metadata: { label: result.label, corrected: false, undelivered: true },
+        });
+      } catch (e) {
+        console.error(`Record update (undelivered) failed: ${message2(e)}`);
+      }
+    }
+
     // 非SPAM で「転送も保存も通知も」全て失敗した最悪ケースだけは、正常終了せず throw して
-    // Cloudflare にメールを委ねる（バウンス/リトライで送信者に失敗が伝わり、完全消失を防ぐ）。
-    // 注: ハンドラ失敗時に Email Routing が送信側 MTA に一時エラーを返し再送に倒れる挙動は
-    // 公式ドキュメントに明文が無い（実観測ベース）。だからこそ「正常終了で握りつぶす」より
+    // Cloudflare にメールを委ねる（一時エラー・再送に倒れれば配送機会が残る）。
+    // ここで setReject を使わないのは意図的: この分岐が発火するのは3経路が同時に落ちる
+    // 相関した「一過性」障害のときで、恒久 SMTP エラー（hard bounce）を返すと
+    // フォームサービス（SendGrid 等）が受信アドレスを suppression list に載せ、
+    // 以後の通知メールがサービス側で送られなくなる＝1通の損失が恒久的な全損に化ける。
+    // 設定不備（ハンドラ冒頭）は恒久的な状態なので、あちらは逆に setReject を使う。
+    // 注: ハンドラ失敗時に Email Routing が送信側 MTA に一時エラーを返す挙動は公式
+    // ドキュメントに明文が無い（実観測ベース）。それでも「正常終了で握りつぶす」より
     // throw の方が安全側 — 最低でも黙って消えることはない
     if (!isSpam && record.forwardFailed && !stored && !notified) {
       throw new Error('All delivery paths failed (no forward, no storage, no notification)');
@@ -359,6 +396,49 @@ async function getFewShotExamples(env) {
 // ---------------------------------------------------------------------------
 // 通知（never-reject）
 // ---------------------------------------------------------------------------
+
+/**
+ * 素通し転送（分類しない経路）。転送が失敗するとメールを届ける手段が無くなるが、
+ * これらの経路はまだ record を作っていないため KV にも隔離ボックスにも残らない。
+ * 失敗を握らず再 throw して Cloudflare の再送に委ねつつ、運用者にだけは知らせる。
+ */
+async function forwardOrAlert(message, env, label) {
+  const h = new Headers();
+  h.set('X-FormGuard-Label', label);
+  try {
+    await message.forward(env.DESTINATION_ADDRESS, h);
+  } catch (error) {
+    console.error(`Forward failed (${label}): ${message2(error)}`);
+    await alertOperator(env, `転送に失敗しました（${label}）`, message2(error), message.from);
+    throw error; // 正常終了させない（黙って消さない）
+  }
+}
+
+/**
+ * 通常の notify() に到達しない経路から運用者へ知らせる（never-reject）。
+ * Slack を設定していれば、これが「無音の事故」を「その場で気づける事故」に変える。
+ */
+async function alertOperator(env, title, detail, from) {
+  const webhook = env.SLACK_WEBHOOK_URL;
+  if (!webhook) return;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), NOTIFY_TIMEOUT_MS);
+  try {
+    const text = `:rotating_light: *[${escapeSlackText(title)}]* form-guard
+${escapeSlackText(detail)}
+差出人: ${escapeSlackText(from || '(不明)')}`;
+    await fetch(webhook, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text, unfurl_links: false, unfurl_media: false }),
+    });
+  } catch (error) {
+    console.error(`Notification failed: ${message2(error)}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** 通知を試み、実際に投稿できたら true を返す（email ハンドラの全滅判定に使う） */
 async function notify(env, record) {
@@ -524,35 +604,90 @@ async function handleQuarantine(url, env) {
   // （＝キーを捨てない。(1)(2) の両方を同時に満たす）。
   const OPS_BUDGET = 900; // list/get の合計。上限約1000への安全マージン
   const MAX_PAGES = 40; // 暴走防止（通常は OPS_BUDGET が先に効く）
+  // 分類結果が入らないまま取り残されたレコードを「未分類」として表示するまでの猶予。
+  // KV の list は結果整合で metadata が最大60秒古くなりうるため、秒ではなく分オーダーが必須。
+  // この経路は分類後に1回だけ put するため通常 label:null は生じないが、経路Aと同一の
+  // ループを保つ（過去の退行は2実装が食い違ったまま片方だけ直したことが原因）
+  const UNCLASSIFIED_GRACE_MS = 10 * 60 * 1000;
+  const startedAt = Date.now();
+  /** キー名の逆順タイムスタンプ（record:<13桁>:<uuid>）から作成後の経過時間を復元する */
+  const recordAgeMs = (name) => {
+    const rev = Number(name.slice(7, 20));
+    return Number.isFinite(rev) ? Date.now() - (9999999999999 - rev) : Infinity;
+  };
   const rows = [];
+  let spamCount = 0;
+  let unclassifiedCount = 0;
+  let undeliveredCount = 0;
   let pageCursor = url.searchParams.get('cursor') || undefined; // 現在ページの取得に使う cursor
   let after = url.searchParams.get('after') || ''; // このキーまで処理済み（同一ページ内の再開位置）
   let ops = 0;
   let pages = 0;
   let failed = 0; // 本文 get に失敗したキー数（poison key・KV 不調の検知）
   let done = false; // 最後まで走査し終えた（moreLink 不要）
+  let listFailed = false; // 一覧の走査自体に失敗した（部分表示であることを画面に出す）
+  // この閲覧で再開位置(after)を進めた回数。0 のまま deadline で打ち切ると再開リンクが
+  // 今の URL と同一になり、何度押しても前に進まないループになるため、前進を条件にする
+  let advanced = 0;
+
+  // ページ内の全キーが metadata で除外されると下の break 判定に到達しないため、
+  // while の継続条件でも実時間を見る（そうしないと list を最大 MAX_PAGES 回まで
+  // 直列に積み上げてしまい、宣言している上限を大きく超える）
+  const pageDeadlineReached = () => advanced > 0 && Date.now() - startedAt > QUARANTINE_PAGE_DEADLINE_MS;
 
   try {
-    outer: while (pages < MAX_PAGES && ops < OPS_BUDGET) {
+    outer: while (pages < MAX_PAGES && ops < OPS_BUDGET && !pageDeadlineReached()) {
       pages++;
       ops++;
-      const list = await env.RECORDS.list({ prefix: 'record:', limit: 1000, cursor: pageCursor });
+      // list にも期限を置く。ここだけ期限が無いと、KV の遅い故障（エラーではなくハング）で
+      // 隔離ボックスが永久に応答を返さず、下の catch にも落ちない＝SPAM を見る手段が消える
+      let list;
+      try {
+        list = await withTimeout(
+          env.RECORDS.list({ prefix: 'record:', limit: 1000, cursor: pageCursor }),
+          STORE_TIMEOUT_MS,
+          'Quarantine list timeout',
+        );
+      } catch (error) {
+        // 走査できなかったことを画面に出す。ここを握って 0 件表示にすると
+        // 「本当に空」と「走査に失敗した」が運用者から区別できず、
+        // 「今月は隔離ゼロ」と誤読されて隔離レコードが放置される（原則5）
+        console.error(`Quarantine listing failed: ${message2(error)}`);
+        listFailed = true;
+        break outer;
+      }
       for (const key of list.keys) {
         if (after && key.name <= after) continue; // 再開時: 処理済みの位置まで読み飛ばす
         const m = key.metadata;
-        // metadata があれば SPAM 以外・修正済み・未分類(label:null)を get せず除外。
+        // 分類結果が書き込まれないまま時間が経ったレコード（label 未確定）は「未分類」として
+        // 表示対象に含める。SPAM だけを索引条件にすると、この取り残しが Slack にも隔離
+        // ボックスにも出ず、問い合わせが人間から完全に見えなくなる（原則1・2の違反）
+        const unclassified = (!m || m.label == null) && recordAgeMs(key.name) > UNCLASSIFIED_GRACE_MS;
+        // 通知に失敗した非SPAM の印。SPAM 以外は通知が唯一の可視面なので、
+        // 通知が届かなかった記録もここに出さないと人間から見えなくなる
+        const undelivered = Boolean(m && m.undelivered);
+        // metadata があれば修正済み・SPAM 以外（未分類の取り残しを除く）を get せず除外。
         // metadata が無い旧データのみ get して中身で判定する（新規デプロイは全件付与済み）
-        if (m && (m.label !== 'SPAM' || m.corrected)) {
+        if (m && (m.corrected || (m.label !== 'SPAM' && !unclassified && !undelivered))) {
           after = key.name;
+          advanced++;
           continue;
         }
-        // 表示上限・操作予算に達したら現在位置で打ち切る（このページの残りは after で再開）
-        if (rows.length >= 50 || ops >= OPS_BUDGET) break outer;
+        // 表示上限・操作予算・実時間の上限に達したら現在位置で打ち切る
+        // （このページの残りは after で再開。判定は after を進める前に行うこと）
+        if (
+          rows.length >= 50 ||
+          ops >= OPS_BUDGET ||
+          pageDeadlineReached()
+        ) {
+          break outer;
+        }
         ops++;
         // after は get の前に進める: get 成功後に進めると、1キーの継続失敗（poison key）で
         // 再開位置が固定化し、後続の全 SPAM に永遠に到達できなくなる。前に進めておけば
         // 失敗したキーはこの再開チェーンではスキップされ、先頭から開き直せば再試行される
         after = key.name;
+        advanced++;
         let raw;
         try {
           raw = await withTimeout(env.RECORDS.get(key.name), STORE_TIMEOUT_MS, 'Quarantine get timeout');
@@ -564,10 +699,24 @@ async function handleQuarantine(url, env) {
         }
         if (!raw) continue;
         const r = JSON.parse(raw);
-        if (r.aiLabel !== 'SPAM' || r.humanLabel) continue;
-        const rescueSig = await hmacHex(env.CORRECTION_SECRET, `${r.key}:LEAD`);
+        if (r.humanLabel) continue;
+        const isUnclassified = unclassified && r.aiLabel == null;
+        const isUndelivered = undelivered && r.notifyFailed === true && r.aiLabel !== 'SPAM';
+        if (r.aiLabel !== 'SPAM' && !isUnclassified && !isUndelivered) continue;
+        const state = r.aiLabel === 'SPAM' ? 'SPAM' : isUnclassified ? '未分類' : '未配信';
+        // SPAM 以外の行は「営業だった」で片付ける導線も要る（SPAM 行は救出のみ）
+        const targets = r.aiLabel === 'SPAM' ? ['LEAD'] : ['LEAD', 'SPAM'];
+        const links = [];
+        for (const label of targets) {
+          const sig2 = await hmacHex(env.CORRECTION_SECRET, `${r.key}:${label}`);
+          const text = label === 'LEAD' ? '本物だった（救出・本文表示）' : '営業だった';
+          links.push(`<a href="/correct?key=${encodeURIComponent(r.key)}&label=${label}&sig=${sig2}">${text}</a>`);
+        }
+        if (isUnclassified) unclassifiedCount++;
+        else if (isUndelivered) undeliveredCount++;
+        else spamCount++;
         rows.push(
-          `<tr><td>${escapeHtml(r.createdAt.slice(0, 10))}</td><td>${escapeHtml(r.from || '')}</td><td>${escapeHtml(r.subject || '')}</td><td>${escapeHtml((r.text || '').slice(0, 100))}</td><td><a href="/correct?key=${encodeURIComponent(r.key)}&label=LEAD&sig=${rescueSig}">本物だった（救出・本文表示）</a></td></tr>`,
+          `<tr><td>${escapeHtml((r.createdAt || '').slice(0, 10))}</td><td>${state}</td><td>${escapeHtml(r.from || '')}</td><td>${escapeHtml(r.subject || '')}</td><td>${escapeHtml((r.text || '').slice(0, 100))}</td><td>${links.join(' / ')}</td></tr>`,
         );
       }
       if (list.list_complete) {
@@ -580,6 +729,7 @@ async function handleQuarantine(url, env) {
   } catch (error) {
     // 例外時も部分結果と再開リンクを返す（隔離ボックス全体を道連れにしない）
     console.error(`Quarantine listing failed: ${message2(error)}`);
+    listFailed = true;
   }
 
   const resumeParams = [
@@ -590,13 +740,19 @@ async function handleQuarantine(url, env) {
     ? ''
     : `<p><a href="/quarantine?sig=${encodeURIComponent(sig)}${resumeParams}">さらに古い記録を見る →</a></p>`;
 
+  const listFailedNote = listFailed
+    ? '<p>⚠️ 記録の一覧取得に失敗したため、この画面は<b>不完全</b>です（表示されていない記録があります）。時間をおいて開き直してください。</p>'
+    : '';
   const failedNote = failed > 0
     ? `<p>⚠️ ${failed} 件の記録が読み込めませんでした（この続きリンクでは読み飛ばします。最初のページから開き直すと再試行されます）</p>`
     : '';
-  return html(`<h1>隔離ボックス（営業と判定されたメール）</h1>
-<p>未対応の SPAM ${rows.length} 件を表示。メールは削除されず、ここからいつでも本文（先頭1万字・添付は保存されません）の確認と救出ができます。月1回の確認をおすすめします。</p>${failedNote}
+  const strandedNote = unclassifiedCount + undeliveredCount > 0
+    ? '<p>⚠️ 「未分類」は AI の判定結果を記録できないまま取り残されたメール、「未配信」は転送にも Slack 通知にも失敗したメールです。どちらも人間に届いていない可能性があるため、内容を確認して片付けてください。</p>'
+    : '';
+  return html(`<h1>隔離ボックス（営業と判定されたメール・届かなかったもの）</h1>
+<p>未対応の SPAM ${spamCount} 件、未分類 ${unclassifiedCount} 件、未配信 ${undeliveredCount} 件を表示。メールは削除されず、ここからいつでも本文（先頭1万字・添付は保存されません）の確認と救出ができます。月1回の確認をおすすめします。</p>${strandedNote}${listFailedNote}${failedNote}
 <table border="1" cellpadding="6" style="border-collapse:collapse">
-<tr><th>日付</th><th>差出人</th><th>件名</th><th>本文（先頭100字）</th><th>操作</th></tr>
+<tr><th>日付</th><th>判定</th><th>差出人</th><th>件名</th><th>本文（先頭100字）</th><th>操作</th></tr>
 ${rows.join('\n')}
 </table>
 ${moreLink}`);
@@ -610,15 +766,23 @@ function reverseTimestamp() {
   return String(9999999999999 - Date.now()).padStart(13, '0');
 }
 
+// importKey は呼ぶたびに CPU を使う。隔離ボックスは1ページで最大100回 hmacHex を
+// 呼ぶため、鍵は isolate 内で使い回す（Workers の CPU 上限は無料プランで 10ms）
+let cachedHmacKey = null;
+let cachedHmacSecret = null;
+
 async function hmacHex(secret, value) {
-  const key = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign'],
-  );
-  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(value));
+  if (cachedHmacSecret !== secret) {
+    cachedHmacKey = await crypto.subtle.importKey(
+      'raw',
+      new TextEncoder().encode(secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign'],
+    );
+    cachedHmacSecret = secret;
+  }
+  const sig = await crypto.subtle.sign('HMAC', cachedHmacKey, new TextEncoder().encode(value));
   return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
@@ -639,10 +803,13 @@ function sleep(ms) {
 
 /** Promise に期限を付ける。期限側が先に落ちても元の Promise は継続する（安全側） */
 function withTimeout(promise, ms, label) {
+  let timer;
   return Promise.race([
     promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(label)), ms)),
-  ]);
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(label)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
 }
 
 function html(body, status = 200) {

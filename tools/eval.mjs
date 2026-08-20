@@ -18,8 +18,9 @@
  *
  * データの行き先は Anthropic API のみ（本番の分類と同一）。他への送信・保存は一切しない。
  * 注意: 基準生成に使った例をここに入れると精度が盛れる。検収用は必ず未使用の例にすること。
- * 注意: この検収は判定基準（criteria.js）の品質を測る簡易評価であり、本番の分類には
- *       few-shot 例・会社名等の文脈が加わるため、結果は本番と完全一致はしない。
+ * 注意: この検収は判定基準（経路A/B は criteria.js、経路C は criteria.mjs）の品質を測る
+ *       簡易評価であり、本番の分類には few-shot 例・会社名等の文脈が加わるため、
+ *       結果は本番と完全一致はしない。
  * 費用の目安: 1件あたり claude-sonnet-5 で約$0.02、claude-haiku-4-5 で約$0.01。
  *
  * 終了コード: 0 = 全件正解 / 1 = 誤分類あり or サンプル不足 / 2 = 分類エラーあり
@@ -72,14 +73,26 @@ if (!API_KEY) {
 // 経路A/B は src/criteria.js、経路C は検収用アダプタ src/criteria.mjs を読む
 // （.mjs は package.json の type や Node の版に関係なく常に ESM として読まれるため、
 // "type":"module" を持たない経路C プロジェクトでも確実に import できる）
-const criteriaPath = ['criteria.js', 'criteria.mjs']
+const criteriaCandidates = ['criteria.js', 'criteria.mjs']
   .map((f) => join(projectDir, 'src', f))
-  .find((p) => existsSync(p));
+  .filter((p) => existsSync(p));
 const samplesDir = join(projectDir, 'samples');
-if (!criteriaPath) {
-  console.error(`判定基準が見つかりません: ${join(projectDir, 'src')}/criteria.js（経路C は criteria.mjs）\n先に SKILL.md Step 2 で判定基準を生成してください。`);
+if (criteriaCandidates.length === 0) {
+  console.error(`判定基準が見つかりません: ${join(projectDir, 'src')}/criteria.js（経路A/B）または criteria.mjs（経路C）\n先に SKILL.md Step 2 で判定基準を生成してください。`);
   process.exit(1);
 }
+// 両方あると「どちらを測ったのか」が結果から判別できない。旧手順で作った criteria.js が
+// 残っている経路C では、本番（criteria.ts）と違う基準で「全件正解・デプロイ可」が出る。
+// criteria.js は .gitignore 済みで git status にも出ないため、API を叩く前にここで止める
+if (criteriaCandidates.length > 1) {
+  console.error(`判定基準のファイルが2つあります。どちらを測ったのか判別できないため中止します:
+${criteriaCandidates.map((p) => `  - ${p}`).join('\n')}
+経路A/B は src/criteria.js だけ、経路C は src/criteria.mjs だけを置いてください
+（経路C の本番コードが読むのは src/criteria.ts です。旧手順で作った criteria.js が
+残っている場合は削除してから再実行してください）。`);
+  process.exit(1);
+}
+const criteriaPath = criteriaCandidates[0];
 if (!existsSync(samplesDir)) {
   console.error(`検収サンプルがありません: ${samplesDir}\nsamples/ に lead_*.txt / spam_*.txt の命名で実例を置いてください。`);
   process.exit(1);
@@ -104,20 +117,61 @@ const missingCriteria = ['COMPANY_NAME', 'COMPANY_BLOCK', 'LABEL_BLOCK'].filter(
 if (missingCriteria.length > 0) {
   console.error(`判定基準の読み込みに失敗しました: ${criteriaPath}
 次のフィールドが欠落しているか空です: ${missingCriteria.join(', ')}
-criteria.js は次のどちらかの形式で export してください:
+判定基準は次のどちらかの形式で export してください:
   1. 経路A/B の形式: export const COMPANY_NAME / COMPANY_BLOCK / LABEL_BLOCK
   2. 経路C の形式:   export const CRITERIA = { companyName, companyBlock, labelBlock }`);
   process.exit(1);
 }
 // テンプレート・雛形のままの基準を検収に通さない。プレースホルダーは「非空の文字列」
 // なので上の検証を素通りし、基準を一切書いていなくても分類が一般常識で当たってしまい
-// 「全件正解 → デプロイに進んでください」という偽の合格が出る
-const SENTINELS = ['YOUR_COMPANY_NAME', 'ここに生成する', '架空の例'];
-const foundSentinels = SENTINELS.filter((s) =>
-  [criteria.COMPANY_NAME, criteria.COMPANY_BLOCK, criteria.LABEL_BLOCK].some((v) => v.includes(s)),
-);
+// 「全件正解 → デプロイに進んでください」という偽の合格が出る。
+// 判定は2層にする。短い語を全フィールドで部分一致させると、正当な基準の中の一般語
+// （「架空の例ではなく実案件だけを受け付ける」等）まで雛形と誤検知して検収が止まる:
+//   層1 = 雛形にしか現れない一意な文字列を、それが現れるフィールドに限定して部分一致
+//   層2 = 同梱の criteria.example.js の値そのものとの完全一致（空白の差は無視）
+// 層1のマーカーは同梱 example の実文面に依存するので、example を書き換えたらここも
+// 更新すること（層2が自動で追随するのは criteria.example.js のほうだけ。
+// 経路C の criteria.example.ts は TypeScript なので import できず、層1で見ている）
+const normalize = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
+const SENTINEL_MARKERS = [
+  { needle: '株式会社サンプル商事', fields: ['COMPANY_NAME', 'COMPANY_BLOCK'] }, // criteria.example.js
+  { needle: 'classifier-skeleton.md のブロック', fields: ['COMPANY_BLOCK', 'LABEL_BLOCK'] }, // criteria.example.ts
+  // prompts/classifier-skeleton.md の骨組みを埋め残した形（生成が途中で終わると残る）。
+  // 波括弧ごと照合するので、同じ語を含む正当な基準（「この会社にとっての既存取引先…」等）
+  // とは衝突しない
+  { needle: '{この会社が何を提供しているか', fields: ['COMPANY_BLOCK', 'LABEL_BLOCK'] },
+  { needle: '{この会社にとっての', fields: ['COMPANY_BLOCK', 'LABEL_BLOCK'] },
+  { needle: '{この会社に実際に届いた', fields: ['COMPANY_BLOCK', 'LABEL_BLOCK'] },
+];
+const foundSentinels = [];
+for (const { needle, fields } of SENTINEL_MARKERS) {
+  for (const field of fields) {
+    if (String(criteria[field]).includes(needle)) foundSentinels.push(`${field} に「${needle}」が残っています`);
+  }
+}
+// 完全一致のみ（「差し込み変数が未置換の営業メール」を SPAM 類型として書いても誤検知しない）
+if (normalize(criteria.COMPANY_NAME) === 'YOUR_COMPANY_NAME') {
+  foundSentinels.push('COMPANY_NAME が「YOUR_COMPANY_NAME」のままです');
+}
+// 経路A/B の LABEL_BLOCK には層1のマーカーが無く、層2だけが「例文のまま」を捕まえる。
+// example を読めないまま黙って続けると、その穴が無言で開く（原則5: 縮退には検知を対にする）
+let example = null;
+try {
+  example = await import(new URL('../templates/cloudflare-worker/src/criteria.example.js', import.meta.url).href);
+} catch (error) {
+  console.warn(`注意: criteria.example.js を読めなかったため、雛形判定を層1のみで実行します（層2スキップ: ${error.message}）。
+このリポジトリ内の tools/eval.mjs から実行すると、例文との完全一致も検証されます。`);
+}
+if (example) {
+  for (const field of ['COMPANY_NAME', 'COMPANY_BLOCK', 'LABEL_BLOCK']) {
+    if (typeof example[field] === 'string' && normalize(criteria[field]) === normalize(example[field])) {
+      foundSentinels.push(`${field} が criteria.example.js の例文のままです`);
+    }
+  }
+}
 if (foundSentinels.length > 0) {
-  console.error(`判定基準がテンプレート（雛形）のままです（「${foundSentinels.join('」「')}」を検出): ${criteriaPath}
+  console.error(`判定基準が雛形（テンプレート）のままです: ${criteriaPath}
+${foundSentinels.map((s) => `  - ${s}`).join('\n')}
 SKILL.md Step 2 で、あなたに実際に届いたメールから基準を生成してから検収してください。`);
   process.exit(1);
 }
@@ -215,7 +269,10 @@ async function classify(text) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-console.log(`事前検収を開始: ${files.length}件 / モデル: ${MODEL}\n`);
+// 何を測ったのかを合格・不合格どちらの出力からも辿れるようにする
+// （どのファイルの基準で通ったのかが分からないと、検収そのものが証跡にならない）
+console.log(`事前検収を開始: ${files.length}件 / モデル: ${MODEL}`);
+console.log(`判定基準: ${criteriaPath}\n`);
 const results = [];
 for (const { file, expected } of files) {
   const text = readFileSync(join(samplesDir, file), 'utf8');
@@ -269,10 +326,10 @@ if (errors.length === results.length) {
     for (const m of misses) {
       console.log(`・${m.file}: 正解 ${m.expected} / 判定 ${m.got} — AI の理由: ${m.reasoning}`);
     }
-    console.log('\n基準（criteria.js）に類型を追記したら、再度このスクリプトを実行してください。');
+    console.log(`\n基準（${criteriaPath}）に類型を追記したら、再度このスクリプトを実行してください。`);
   }
   if (misses.length === 0 && errors.length === 0) {
-    console.log('\n全件正解です。samples/ を削除して、デプロイに進んでください。');
+    console.log(`\n全件正解です（判定基準: ${criteriaPath}）。samples/ を削除して、デプロイに進んでください。`);
   }
 }
 console.log('\n※ この検収は判定基準の品質を測る簡易評価です。本番の分類には few-shot 例・会社名等の文脈が加わるため、結果は完全一致しません。');

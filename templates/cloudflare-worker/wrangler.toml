@@ -4,7 +4,8 @@
 #   1. npx wrangler kv namespace create RECORDS  → 出力された id を下の kv_namespaces に貼る
 #   2. npx wrangler secret put ANTHROPIC_API_KEY
 #   3. npx wrangler secret put CORRECTION_SECRET   （openssl rand -hex 32 などで生成）
-#   4. npx wrangler secret put SLACK_WEBHOOK_URL   （通知先。SPAM 専用は SLACK_WEBHOOK_SPAM・任意）
+#   4. npx wrangler secret put SLACK_WEBHOOK_URL   （**必須**。未設定だと /submit が 500 を返して
+#      受付が止まる。SPAM 専用の SLACK_WEBHOOK_SPAM は任意で、未設定なら SPAM は隔離ボックスのみ）
 #   5. npx wrangler deploy
 
 name = "form-guard-worker"
