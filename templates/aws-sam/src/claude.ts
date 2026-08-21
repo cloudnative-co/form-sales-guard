@@ -190,16 +190,31 @@ ${stripUntrustedTags(input.message)}
     // LLM の JSON 出力は「全フィールドが欠落・型不正・途中切断されうる」前提で受ける
     // （PITFALLS A-4: reasoning 欠落 1 つが TypeError → キュー再試行 → 通知の二重実行
     // という障害連鎖に化けた実話）。as キャストではなく実行時の型ガードで検証する。
-    const parsed: unknown = JSON.parse(jsonText);
+    // JSON.parse の例外文言は入力の先頭を引用する（現状の V8 は10文字で切るが、
+    // 依存すべき仕様ではない）。下の catch でロググループに出るため、自前の文言に置き換えて
+    // 外部由来の文字列がアラームの契約文字列に化ける経路を塞ぐ（PITFALLS F-3）
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(jsonText);
+    } catch {
+      throw new Error('Response is not valid JSON');
+    }
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
       throw new Error('Response is not a JSON object');
     }
     const candidate = parsed as Record<string, unknown>;
 
-    // label: enum 検証。不正なら分類失敗として catch（→REVIEW フォールバック）へ落とす
+    // label: enum 検証。不正なら分類失敗として catch（→REVIEW フォールバック）へ落とす。
+    // ⚠️ 実際に来た値をそのままメッセージに載せないこと。この例外文言は下の
+    // log.error('Classification failed') の errorMessage に載り、**メトリクスフィルタが
+    // 見張っているロググループに出力される**。label は LLM の出力＝フォーム入力の影響下に
+    // あるため、他のアラームの契約文字列（"Failed to update classification" 等）を
+    // 送信者が仕込めてしまい、誤発報でアラーム通知ごと切られる（PITFALLS F-3）。
+    // 英数字・ハイフン・アンダースコアだけに丸めて長さも切る
     const label = candidate.label;
     if (typeof label !== 'string' || !['LEAD', 'REVIEW', 'SPAM'].includes(label)) {
-      throw new Error(`Invalid label: ${String(label)}`);
+      const safeLabel = String(label).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 20);
+      throw new Error(`Invalid label: ${safeLabel || '(unprintable)'}`);
     }
 
     // confidence: 数値かつ 0-100 のみ採用。それ以外は既定値 50

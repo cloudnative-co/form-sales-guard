@@ -168,6 +168,21 @@ ${error.message}
     );
     process.exit(1);
   }
+  // 経路C で `import type` から type だけを落とすと、型剥がしは「型のインポート」を消せず
+  // 実行時 import として残すため、SyntaxError ではなく解決失敗（ERR_MODULE_NOT_FOUND）になる。
+  // 上の TS 用案内はこの故障そのものを説明しているのに、この経路では到達しなかった
+  if (error?.code === 'ERR_MODULE_NOT_FOUND' && criteriaPath.endsWith('.ts')) {
+    console.error(`判定基準から読み込んでいるモジュールを解決できませんでした: ${criteriaPath}
+${error.message}
+型のインポートには必ず type を付けてください（同梱の criteria.example.ts の1行目がその形です）:
+  import type { ClassificationCriteria } from './claude.js';
+type が無いと実行時の import として残ります。Node は型注釈を剥がすだけで、インポート先を
+.js から .ts に読み替えません。そのため存在しない claude.js を探して失敗します
+（拡張子を .ts に直すと、今度は本体とその依存パッケージまで読み込みに行きます）。
+型を使わずに書いても構いません（その場合も CRITERIA という export 名は変えないこと）。
+上のメッセージが型ではなく実データのモジュールを指している場合は、そのファイルの実在を確認してください。`);
+    process.exit(1);
+  }
   console.error(`判定基準を読み込めませんでした: ${criteriaPath}\n${error?.message ?? String(error)}`);
   process.exit(1);
 }

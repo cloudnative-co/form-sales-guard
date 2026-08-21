@@ -218,7 +218,7 @@ export default {
     const notified = await notify(env, record);
 
     // 転送にも通知にも失敗した非SPAM は、KV には残るのに人間の目に触れる面が無くなる
-    // （隔離ボックスは SPAM 専用）。metadata の undelivered で隔離ボックスに出す。
+    // （隔離ボックスの既定の絞り込みは SPAM のみ）。metadata の undelivered で隔離ボックスに出す。
     // 同一キーへの2回目の書き込みはここだけ（転送失敗を put で永続化する中間段は廃止した）。
     // 転送に失敗しても通知が届いていれば書かない: その記録は Slack で人間に届いており
     // （通知文にも「この通知が唯一の記録です」と出る）、隔離ボックスの絞り込み条件も
@@ -345,7 +345,9 @@ function parseClassification(text) {
   }
   const label = parsed.label;
   if (typeof label !== 'string' || !['LEAD', 'REVIEW', 'SPAM'].includes(label)) {
-    throw new Error(`Invalid label: ${String(label)}`);
+    // 値をそのまま載せない。この文言は "Classification failed" のログに載るので、
+    // ログ文字列でアラームを組む構成では外部から検知を誤発火させられる（PITFALLS F-3）
+    throw new Error(`Invalid label: ${String(label).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 20) || '(unprintable)'}`);
   }
   const confidence =
     typeof parsed.confidence === 'number' && parsed.confidence >= 0 && parsed.confidence <= 100

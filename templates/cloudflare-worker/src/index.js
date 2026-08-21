@@ -105,9 +105,10 @@ async function handleSubmit(request, env, ctx) {
     }
   }
 
-  // 通知先が無いなら受け付けない。受け付けて 200 を返すと、LEAD/REVIEW を人間が見る面が
-  // どこにも無いまま「送信できた」ことになる（隔離ボックスは SPAM 専用）。送信者にエラーが
-  // 見えれば電話・メール等に切り替えられるので、黙って受け取って消すより安全側（原則1）
+  // 通知先が無いなら受け付けない。受け付けて 200 を返すと、LEAD/REVIEW が人間に push される
+  // 面がどこにも無いまま「送信できた」ことになる（隔離ボックスの「未配信」行には出るが、
+  // あれは月1回見る面であって通知ではない）。送信者にエラーが見えれば電話・メール等に
+  // 切り替えられるので、黙って受け取って消すより安全側（原則1）
   const missingNotify = missingNotifyConfig(env);
   if (missingNotify) {
     console.error(`Missing required configuration: ${missingNotify}（通知先が無いため受付を停止しました）`);
@@ -219,9 +220,10 @@ async function processSubmission(env, record, acceptedAt) {
   // （Cloudflare 公式も「1 invocation 内の同一キー書き込みは1回にまとめる」を推奨）。
   const notified = await notify(env, record); // 通知失敗もここで握る（never-reject）
 
-  // 通知が届かなかった記録は、この経路では人間の目に触れる面が1つも無くなる
-  // （隔離ボックスは SPAM 専用で、LEAD/REVIEW は Slack にしか出ない）。Webhook の失効・
-  // チャンネル削除・Slack 障害でも起きるので、設定の有無を見る fail-fast では塞げない。
+  // 通知が届かなかった記録は、印を付けなければ人間の目に触れる面が1つも無くなる
+  // （隔離ボックスの既定の絞り込みは SPAM のみで、LEAD/REVIEW は Slack にしか出ない）。
+  // Webhook の失効・チャンネル削除・Slack 障害でも起きるので、設定の有無を見る
+  // fail-fast では塞げない。
   // metadata の undelivered と本文の notifyFailed は必ず同時に書くこと。隔離ボックスは
   // metadata で絞り込み・本文で確定するため、片方だけだと「get はされるのに行にならない」
   // ＝不可視のまま ops だけ食う記録になる
@@ -256,9 +258,34 @@ async function processSubmission(env, record, acceptedAt) {
 /**
  * 分類後の保存が落ちたことだけを主チャンネルに知らせる（KV 書き込みを伴わない軽量アラート）。
  * waitUntil の打ち切りに巻き込まれると失われるが、失うのはアラートだけで記録は壊れない。
+ * notify() を別チャネル（メール送信 API・Teams 等）に差し替えるときは、この関数も
+ * 合わせて直すこと（missingNotifyConfig() と同じ理由。残すと保存失敗の⚠️だけが
+ * 旧チャンネルに出るか、旧シークレットごと消していれば黙って消える）。
  */
 async function alertStorageFailure(env, record) {
   if (!env.SLACK_WEBHOOK_URL) return;
+  // ⚠️ 記録がどこに残るかを断定しないこと。storageFailed は「受付時の put が期限内に
+  // 完了しなかった」でしかなく、KV に記録が有るか無いかを判別しない（put は中断できず、
+  // 期限超過後に着地することがある＝PITFALLS G-1）。同様に「先に通知が届いている」も
+  // 断定できない —— この関数は SPAM のときだけでなく **通知が失敗したとき**にも呼ばれる。
+  // 3つの状態で運用者が次に取るべき行動が違うので、そこだけを書く。
+  // なお storageFailed=true のとき notify() の isSpam は false になるので、主通知が
+  // 出ていればこのアラートと同じ SLACK_WEBHOOK_URL に出ている（notify() の isSpam 式と対）。
+  // 判定に使うのは record.notifyFailed（notify の直後に確定済み）。引数で二重に持たない
+  let tail;
+  if (!record.storageFailed) {
+    // 受付時の記録は残っているので、分類ラベルが入らないまま隔離ボックスに出る。
+    // ただし期限超過した分類後 put が後から着地すると SPAM / 未配信として出たり、
+    // 通知済みの LEAD/REVIEW として絞り込みから外れたりする（＝出ないこともある）
+    tail = 'この問い合わせは隔離ボックスに残ります（受付から10分ほど後に、多くは「未分類」として表示されます。保存が遅れて成功していた場合は通常の判定として片付いていることもあります）。';
+  } else if (!record.notifyFailed) {
+    tail = '受付時の保存も失敗しているため、このチャンネルに先に届いた⚠️付き通知の内容で対応してください（隔離ボックスに現れない場合があります）。';
+  } else {
+    // 保存も通知も落ちた最悪ケース。**このメッセージが唯一の残存記録**になりうるので、
+    // 行動指示ではなく内容そのものを載せる。Worker のログには本文もメールアドレスも
+    // 出ておらず（console.error はエラー文言だけ）、`wrangler tail` は過去を取得できない
+    tail = `受付時の保存も通知も失敗しており、隔離ボックスにも現れない可能性があります。**この通知が唯一の記録です** —— メール: ${escapeSlackText(record.email)} / 本文: ${escapeSlackText(record.message.slice(0, 300))}`;
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), NOTIFY_TIMEOUT_MS);
   try {
@@ -267,7 +294,7 @@ async function alertStorageFailure(env, record) {
       signal: controller.signal,
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        text: `:warning: *[${record.aiLabel}]* 分類結果の保存に失敗しました（${escapeSlackText(record.company || '(会社名なし)')} — ${escapeSlackText(record.name)}）。この問い合わせは隔離ボックスに「未分類」として残ります。`,
+        text: `:warning: *[${record.aiLabel}]* 分類結果の保存に失敗しました（${escapeSlackText(record.company || '(会社名なし)')} — ${escapeSlackText(record.name)}）。${tail}`,
         unfurl_links: false,
         unfurl_media: false,
       }),
@@ -344,7 +371,9 @@ function parseClassification(text) {
 
   const label = parsed.label;
   if (typeof label !== 'string' || !['LEAD', 'REVIEW', 'SPAM'].includes(label)) {
-    throw new Error(`Invalid label: ${String(label)}`);
+    // 値をそのまま載せない。この文言は "Classification failed" のログに載るので、
+    // ログ文字列でアラームを組む構成では外部から検知を誤発火させられる（PITFALLS F-3）
+    throw new Error(`Invalid label: ${String(label).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 20) || '(unprintable)'}`);
   }
 
   const confidence =
@@ -468,10 +497,11 @@ async function getFewShotExamples(env) {
 
 /**
  * 受け付けた問い合わせを届ける先が設定されているか（未設定なら欠落している設定名を返す）。
- * 通知先が無いまま受け付けると LEAD/REVIEW は Slack にも隔離ボックス（SPAM 専用）にも
- * 出ず、人間から完全に見えなくなる。だから /submit はこれを受付の前提条件として扱う。
- * notify() を別チャネル（メール送信 API・Teams 等）に差し替えるときは、この関数も
- * 合わせて直すこと（「届ける先がある」の定義が変わるため）。
+ * 通知先が無いまま受け付けると LEAD/REVIEW は Slack に出ず、隔離ボックスの「未配信」行
+ * （月1回見る面）にしか残らない＝人間に push される面がゼロになる。
+ * だから /submit はこれを受付の前提条件として扱う。
+ * notify() を別チャネル（メール送信 API・Teams 等）に差し替えるときは、この関数と
+ * alertStorageFailure() も合わせて直すこと（「届ける先がある」の定義が変わるため）。
  */
 function missingNotifyConfig(env) {
   return env.SLACK_WEBHOOK_URL ? null : 'SLACK_WEBHOOK_URL';
@@ -483,6 +513,8 @@ async function notify(env, record) {
     // 受付時の記録保存に失敗した SPAM は隔離ボックスに現れないため、SPAM 扱いせず通常通知に流す
     // （storageFailed は受付時 put の成否。この通知は分類後 put より前に出るので、
     //   分類後 put の成否はここでは分からない ── handleSubmit / processSubmission 参照）
+    // ⚠️ この式を変えるときは alertStorageFailure() の文面も見ること
+    // （「主通知は同じ SLACK_WEBHOOK_URL に出ている」という前提がここに依存している）
     const isSpam = record.aiLabel === 'SPAM' && !record.classificationFailed && !record.storageFailed;
     const webhook = isSpam ? env.SLACK_WEBHOOK_SPAM : env.SLACK_WEBHOOK_URL;
     if (!webhook) {
@@ -495,6 +527,8 @@ async function notify(env, record) {
     const emoji = { LEAD: ':tada:', REVIEW: ':thinking_face:', SPAM: ':wastebasket:' }[record.aiLabel] || ':question:';
     const warn = [
       record.classificationFailed ? '\n:warning: *AI分類が失敗したため人間による確認が必要です*' : '',
+      // ⚠️ この storageFailed 行の :warning: が alertStorageFailure の
+      // 「先に届いた⚠️付き通知」の根拠。別便のアラートと重複して見えても消さないこと
       record.storageFailed ? '\n:warning: *受付時の記録保存に失敗しました。隔離ボックスに残らない可能性があるため、この通知で内容を確認してください*' : '',
     ].join('');
     const links = await correctionLinks(env, record);

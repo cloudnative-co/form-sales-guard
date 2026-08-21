@@ -301,9 +301,11 @@ Resources:
   # DeletionPolicy: Retain は「既に Lambda が自動作成したロググループを持つ運用中スタックへ
   # あとから取り込む（auto-import）」ための要件。CloudFormation の auto-import は対象リソースが
   # Retain か RetainExceptOnCreate であることを要求する（AWS 公式）。これが無いと、既存スタックの
-  # 更新時に `already exists` を避ける手段が「ログを消す」しか無くなる（README 手順5）。
+  # 更新時に `already exists` を避ける手段が「ログを消す」しか無くなる（README 手順6）。
   # 副作用: `sam delete` してもロググループは残る。完全に片付けるなら
-  # `aws logs delete-log-group` を手で実行すること（RetentionInDays の設定は残るので放置しても消える）
+  # `aws logs delete-log-group` を手で実行すること（新規作成した場合は下の RetentionInDays が
+  # 残るので放置してもログは消えるが、auto-import で取り込んだ場合は無期限のまま —
+  # import は既存リソースにテンプレートのプロパティを適用しない）
   ProcessorLogGroup:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Retain
@@ -318,6 +320,14 @@ Resources:
     UpdateReplacePolicy: Retain
     Properties:
       LogGroupName: /aws/lambda/form-guard-classifier
+      RetentionInDays: 90
+
+  FeedbackLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: /aws/lambda/form-guard-feedback
       RetentionInDays: 90
 
   # 受付ハンドラの hard fail（DynamoDB PutItem / SQS SendMessage の失敗）の検知。
@@ -344,6 +354,64 @@ Resources:
       AlarmDescription: Form submission rejected with 500 - classifier logged 'Handler error' (DynamoDB/SQS failure)
       Namespace: FormGuard
       MetricName: ClassifierHandlerErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  # 修正ボタン（feedback）の失敗の検知。classifier と同じ形で2本立てる:
+  # (1) catch 済みの失敗はログ文字列で（feedback.ts の log.error との契約）
+  # (2) catch の外の失敗（初期化・タイムアウト・OOM）は AWS/Lambda の Errors で
+  # 壊れるのは安全不変条件6（人間の修正 → few-shot 還流）そのもので、A-1 と同じ
+  # 「静かに効かなくなる」形をとる。修正が効かない状態は分類精度の劣化として現れるが、
+  # 原因が feedback 側にあることは分類のアラームからは分からない
+  FeedbackErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FeedbackLogGroup
+      # ⚠️ OR で書くときは全項に ? を付けること（1つでも非 ? 項を混ぜると ? 項が
+      # 全部無視される・AWS 公式。PITFALLS F-4）
+      FilterPattern: '?"Feedback handler error" ?"Failed to update Slack message"'
+      MetricTransformations:
+        - MetricName: FeedbackFailures
+          MetricNamespace: FormGuard
+          MetricValue: '1'
+          DefaultValue: 0
+
+  FeedbackErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: form-guard-feedback-errors
+      AlarmDescription: Slack correction button failed - the human feedback loop (few-shot reflow) is silently broken
+      Namespace: FormGuard
+      MetricName: FeedbackFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  FeedbackLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: form-guard-feedback-lambda-errors
+      AlarmDescription: Feedback Lambda is failing outside its try/catch (config, init, timeout, OOM) - correction buttons return 502
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FeedbackFunction
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
@@ -419,7 +487,8 @@ Resources:
 
   # 記録更新失敗の検知（失敗すると「分類ラベルなしのまま Slack 通知だけ完了」という
   # データ不整合がサイレントに発生するため）。Slack ts の保存失敗（修正ボタンの
-  # 逆引きが壊れる）も同じ「記録の不整合」としてここで検知する（?A ?B は OR マッチ）
+  # 逆引きが壊れる）も同じ「記録の不整合」としてここで検知する（?A ?B は OR マッチ。
+  # ⚠️ 全項に ? を付けること —— 非 ? 項を混ぜると ? 項が全部無視される・PITFALLS F-4）
   RecordUpdateFailureMetricFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
@@ -479,14 +548,24 @@ Resources:
   # メッセージをキュー末尾に移動し ApproximateAgeOfOldestMessage の対象から外す」ため
   # （AWS 公式・redrive policy があっても同じ）、VisibilityTimeout=720 だと受信#3 は
   # 滞留24分で、下の QueueAgeAlarm の30分閾値に届く前に対象外になる。
-  # 「5分枠のうち2枠でエラー」= M-out-of-N（EvaluationPeriods 6 / DatapointsToAlarm 2）に
+  # 「6枠のうち2枠でエラー」= M-out-of-N（EvaluationPeriods 6 / DatapointsToAlarm 2）に
   # しているのは、単発で自己回復するエラー（一時的な Secrets Manager 失敗・コールドスタート等）
-  # で鳴らさないため。
-  # ⚠️ 「15分枠でエラー2回」（Period 900 / Threshold 2）にしてはいけない: CloudWatch の
-  # 評価枠は絶対時刻に整列するので、12分間隔の再試行は枠をまたぎ続けることがあり
-  # （例: 14分・26分・38分…はどれも別の15分枠）、本物の poison pill でも永久に鳴らない。
-  # M-out-of-N なら 30分の観測窓に2枠入ればよいので、受信#1(0分) と #2(12分) で
-  # 約15分後に発火する＝年齢メトリクスから外れる受信#3(24分) より前に検知できる。
+  # で鳴らさないため。即座に失敗するメッセージなら受信#1(0分) と #2(12分) の2回で
+  # 十数分後に発火する＝年齢メトリクスから外れる受信#3(24分) より前に検知できる
+  # （関数タイムアウトで落ちる種類なら1回あたり最大120秒ぶん後ろにずれるが、
+  #  それでも DLQ 到達＝6回目の受信より前に鳴る）。
+  # ⚠️ 「窓の中で合計2回」（Period 900 / Threshold 2）に置き換えないこと: Sum が2に達し
+  # さえすればよいので、同じ1分の中で別メッセージ2件が同時に失敗しただけ（同時実行中の
+  # 一過性障害・デプロイ直後のコールドスタート）でも即 ALARM になる。Lambda は Errors を
+  # 1分間隔で発行するため、同一分の複数エラーは1 datapoint に潰れて6枠のうち2枠を占められず、
+  # M-out-of-N はこの一点を弾ける（弾けるのはここだけで、1分でもずれた2件は発火する。
+  # CloudWatch の既定の評価窓は wall clock に整列しない sliding window で、評価のたびに
+  # 1分ずつ進むため、「枠をまたいで永久に鳴らない」ことは起きない
+  # https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/alarm-evaluation.html
+  # —— そもそも Period 900 は wall clock 整列に切り替えられる Period ですらない
+  # https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/alarm-evaluation-window.html ）。
+  # なおこの理由づけは BatchSize 1（1呼び出し＝1メッセージ）が前提。BatchSize を上げると
+  # Errors の粒度が変わるので、そのときはこの設計も見直すこと。
   # 既存アラームと形が違うのはこの理由。ノイズで通知を切られると、サイレント劣化を
   # 検知する ClassificationFailureAlarm ごと無音化するため、鳴らしすぎも危険
   ProcessorErrorAlarm:
@@ -548,6 +627,7 @@ Resources:
     Type: AWS::Logs::MetricFilter
     Properties:
       LogGroupName: !Ref ProcessorLogGroup
+      # ⚠️ OR は全項に ? を付けること（非 ? 項を混ぜると ? 項が全部無視される・PITFALLS F-4）
       FilterPattern: '?"Invalid JSON in SQS message" ?"Invalid SQS message structure"'
       MetricTransformations:
         - MetricName: MalformedMessages
@@ -643,3 +723,6 @@ Outputs:
   ProcessingDLQUrl:
     Description: DLQ の URL（redrive 前に PITFALLS C-5 を必ず読むこと）
     Value: !Ref ProcessingDLQ
+  AlarmTopicArn:
+    Description: アラーム通知先の SNS トピック（AlarmEmail の購読確認に使う。README 手順5）
+    Value: !Ref AlarmTopic

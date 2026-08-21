@@ -11,7 +11,8 @@ description: お問い合わせフォームに届く営業スパム（フォー�
 フォーム受信 → 即「受け付けました」応答 → 裏で AI 分類
   → LEAD（本物の問い合わせ）: すぐ通知
   → REVIEW（判断が難しい）: 人間確認として通知
-  → SPAM（営業文面）: 通知せず隔離（削除はしない・いつでも一覧できる）
+  → SPAM（営業文面）: 通常の通知には出さず隔離（削除はしない・いつでも一覧できる。
+                      専用の通知先を設定すればそちらにだけ流せる）
 人間が判定を修正 → 次回以降の分類プロンプトに反映（使うほど賢くなる）
 ```
 
@@ -80,7 +81,7 @@ description: お問い合わせフォームに届く営業スパム（フォー�
 
 [templates/cloudflare-worker/](templates/cloudflare-worker/) を土台に、利用者のプロジェクトフォルダへコピーして調整する:
 
-1. `criteria.example.js` を参考に、Step 2 の基準で `criteria.js` を生成
+1. `criteria.example.js` を参考に、Step 2 の基準で `criteria.js` を生成（経路C は `src/criteria.example.ts` を**コピーして** `src/criteria.ts` を作り、値だけを差し替える。**1行目の `import type` から `type` を落とさないこと** —— 落とすと実行時 import として残り、検収が「モジュールを解決できません」で止まる）
 2. Q2 の通知先に合わせて通知関数を調整（既定は Slack Incoming Webhook。メールの場合は Resend 等の送信 API を提案し、無料枠と登録手順を案内）
 3. Q3 で (b)(c) を選んだ場合は記録アダプタを追加（内蔵 KV 記録は残す — 隔離ボックスと few-shot の基盤のため）
 4. フォーム側の送信先を Worker の `/submit` に向ける変更を案内（経路 Aの場合）。フォームがまだ無い場合はテストフォーム（`TEST_FORM` フラグ）を本番フォームの雛形として提供
@@ -109,8 +110,12 @@ description: お問い合わせフォームに届く営業スパム（フォー�
    npx wrangler kv namespace create RECORDS   # 記録の保存場所を作成 → wrangler.toml に反映
    npx wrangler secret put ANTHROPIC_API_KEY
    npx wrangler secret put SLACK_WEBHOOK_URL   # 経路Aでは必須（未設定だと /submit が 500 を返し受付が止まる）
-   # 通知先を Slack 以外（メール送信 API・Teams 等）にする場合は、notify() と一緒に
-   # index.js の missingNotifyConfig() も差し替えること（「届ける先がある」の定義が変わる）
+   npx wrangler secret put SLACK_WEBHOOK_SPAM  # 任意。SPAM 専用チャンネル（未設定なら SPAM は隔離ボックスだけ）
+   # 通知先を Slack 以外（メール送信 API・Teams 等）にする場合、index.js で Slack を読む面は
+   # notify() / missingNotifyConfig() / alertStorageFailure() の3つ。まとめて差し替えること
+   # （grep -n 'SLACK_WEBHOOK\|escapeSlackText\|correctionLinks' src/index.js で全部出る）。
+   # alertStorageFailure() を残すと、保存失敗の⚠️だけが旧チャンネルに出るか黙って消える。
+   # Slack 固有の記法（mrkdwn のエスケープ・<URL|ラベル> の修正リンク）も移送先の形式に直す
    npx wrangler secret put CORRECTION_SECRET   # ランダム生成して設定（openssl rand -hex 32 等）
    npx wrangler deploy
    ```

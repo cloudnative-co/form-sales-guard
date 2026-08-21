@@ -13,7 +13,8 @@
 #   5. npx wrangler secret put ANTHROPIC_API_KEY
 #      npx wrangler secret put CORRECTION_SECRET   （openssl rand -hex 32 等で生成）
 #      npx wrangler secret put SLACK_WEBHOOK_URL   （任意）
-#      npx wrangler secret put SLACK_WEBHOOK_SPAM  （任意・SPAM を別チャンネルにも流す場合）
+#      npx wrangler secret put SLACK_WEBHOOK_SPAM  （任意・SPAM 専用チャンネル。
+#      未設定なら SPAM は Slack に通知されず隔離ボックスのみ。SLACK_WEBHOOK_URL には流れない）
 #   6. npx wrangler deploy → 表示された Worker の URL を下の PUBLIC_URL に貼って再デプロイ
 #      （未設定だと Slack 通知内の修正リンクが壊れる）
 #   7. Email Routing のルーティングルールで「form-guard@... → Send to a Worker → このWorker」を設定
